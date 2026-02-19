@@ -855,54 +855,314 @@ class Program
             await Task.CompletedTask;
         };
 
-        // scan <host> [start-end] - limited port scan only for local/private addresses
+        // scan <host|local> [ports] - improved scanner: resolves host, shows IP(s), reverse dns, attempts banner grabs.
+        // If target is 'local', 'in', 'lan', 'network' or omitted the command will discover other hosts on the local /24 and scan them.
         BuiltInCommands["scan"] = async args =>
         {
-            if (args.Length == 0) { Console.WriteLine("Usage: scan <host|url> [start-end]"); await Task.CompletedTask; return; }
-            var input = args[0]; int start = 20, end = 1024;
-            if (args.Length > 1)
-            {
-                var parts = args[1].Split('-'); if (parts.Length == 2) { int.TryParse(parts[0], out start); int.TryParse(parts[1], out end); }
-            }
-            start = Math.Max(1, start); end = Math.Min(65535, end);
-            if (end - start > 200) { Console.WriteLine("Range too large; limit to 200 ports"); end = start + 199; }
             try
             {
-                string host;
-                int singlePort = -1;
-                if (input.StartsWith("http://", StringComparison.OrdinalIgnoreCase) || input.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
-                {
-                    var u = new Uri(input); host = u.Host; if (u.Port > 0) singlePort = u.Port;
-                }
-                else if (input.IndexOf(':') > 0 && !input.Contains('/'))
-                {
-                    var sp = input.Split(':'); host = sp[0]; if (int.TryParse(sp[1], out var p)) singlePort = p;
-                }
-                else host = input;
+                // support flag --allow-external to permit scanning non-private/public addresses (must be explicit)
+                var argList = args.ToList();
+                bool allowExternal = false;
+                for (int i = argList.Count - 1; i >= 0; i--) if (argList[i].Equals("--allow-external", StringComparison.OrdinalIgnoreCase)) { allowExternal = true; argList.RemoveAt(i); }
 
-                var addrs = await Dns.GetHostAddressesAsync(host);
-                var addr = addrs.FirstOrDefault(); if (addr == null) { Console.WriteLine("Could not resolve host"); await Task.CompletedTask; return; }
-                string saddr = addr.ToString();
-                bool ok = saddr.StartsWith("127.") || saddr == "::1" || saddr.StartsWith("10.") || saddr.StartsWith("192.168.") || (saddr.StartsWith("172.") && int.TryParse(saddr.Split('.')[1], out var b) && b >= 16 && b <= 31);
-                if (!ok) { Console.WriteLine("Scan restricted to localhost / private network addresses for safety"); await Task.CompletedTask; return; }
+                string targetArg = argList.Count > 0 ? argList[0] : "local";
+                string portsArg = argList.Count > 1 ? argList[1] : "22,80,443,3389,3306,8080,53,21,25,445";
 
-                if (singlePort > 0)
+                var doSubnetScan = new[] { "local", "in", "lan", "network", "subnet", "" };
+                if (doSubnetScan.Contains(targetArg.ToLowerInvariant()))
                 {
-                    // scan a small window around the provided port
-                    start = Math.Max(1, singlePort - 2);
-                    end = Math.Min(65535, singlePort + 2);
+                    // find local IPv4 and IPv6 addresses
+                    string localV4 = null;
+                    var localV6 = new List<IPAddress>();
+                    foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
+                    {
+                        if (ni.OperationalStatus != OperationalStatus.Up) continue;
+                        foreach (var ua in ni.GetIPProperties().UnicastAddresses)
+                        {
+                            if (ua.Address.IsIPv4MappedToIPv6) continue;
+                            if (ua.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork && !IPAddress.IsLoopback(ua.Address)) { localV4 ??= ua.Address.ToString(); }
+                            if (ua.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6 && !IPAddress.IsLoopback(ua.Address)) localV6.Add(ua.Address);
+                        }
+                        if (localV4 != null || localV6.Count > 0) break;
+                    }
+                    if (localV4 == null && localV6.Count == 0) { Console.WriteLine("No local IP addresses found."); await Task.CompletedTask; return; }
+
+                    if (localV4 != null)
+                    {
+                        var parts = localV4.Split('.'); var prefix = string.Join('.', parts.Take(3)) + ".";
+                        int max = 64; // limit sweep size
+                        if (argList.Count > 1 && int.TryParse(argList[1], out var m)) max = Math.Min(254, Math.Max(4, m));
+                        Console.WriteLine($"Scanning local IPv4 subnet {prefix}1-{prefix}{max} (ping sweep + port scan)...");
+
+                        // ping sweep (IPv4)
+                        var up = new List<string>();
+                        var pingSem = new System.Threading.SemaphoreSlim(100);
+                        var pingTasks = new List<Task>();
+                        for (int i = 1; i <= max; i++)
+                        {
+                            var ip = prefix + i;
+                            await pingSem.WaitAsync();
+                            pingTasks.Add(Task.Run(async () =>
+                            {
+                                try { using var p = new Ping(); var r = await p.SendPingAsync(ip, 300); if (r.Status == IPStatus.Success) lock (up) { up.Add(ip); } }
+                                catch { }
+                                finally { pingSem.Release(); }
+                            }));
+                        }
+                        await Task.WhenAll(pingTasks);
+                        up = up.OrderBy(x => x).ToList();
+                        Console.WriteLine($"IPv4 hosts up: {string.Join(',', up)}");
+
+                        // parse portsArg
+                        var ports = new List<int>();
+                        foreach (var token in portsArg.Split(',', StringSplitOptions.RemoveEmptyEntries))
+                        {
+                            var t = token.Trim();
+                            if (t.Contains('-'))
+                            {
+                                var p = t.Split('-', 2);
+                                if (int.TryParse(p[0], out var a) && int.TryParse(p[1], out var b)) { for (int j = Math.Min(a,b); j <= Math.Max(a,b); j++) ports.Add(j); }
+                            }
+                            else if (int.TryParse(t, out var p)) ports.Add(p);
+                        }
+                        ports = ports.Distinct().Where(p => p >= 1 && p <= 65535).OrderBy(p => p).ToList();
+                        if (ports.Count == 0) { Console.WriteLine("No ports to scan."); await Task.CompletedTask; return; }
+
+                        var wellKnown = new Dictionary<int,string> { [22] = "ssh", [80] = "http", [443] = "https", [3389] = "rdp", [3306] = "mysql", [8080] = "http-alt", [53] = "dns", [21] = "ftp", [25] = "smtp", [445] = "microsoft-ds" };
+
+                        // scan each up host, limited parallelism
+                        var hostSem = new System.Threading.SemaphoreSlim(10);
+                        var hostTasks = new List<Task>();
+                        foreach (var h in up)
+                        {
+                            await hostSem.WaitAsync();
+                            hostTasks.Add(Task.Run(async () =>
+                            {
+                                try
+                                {
+                                    Console.WriteLine($"\nHost: {h}");
+                                    foreach (var port in ports)
+                                    {
+                                        try
+                                        {
+                                            using var tc = new TcpClient();
+                                            var conn = tc.ConnectAsync(h, port);
+                                            var comp = await Task.WhenAny(conn, Task.Delay(500));
+                                            if (comp == conn && tc.Connected)
+                                            {
+                                                Console.Write($"  {port}: open"); if (wellKnown.TryGetValue(port, out var svc)) Console.Write($" ({svc})"); Console.WriteLine();
+                                            }
+                                        }
+                                        catch { }
+                                    }
+                                }
+                                finally { hostSem.Release(); }
+                            }));
+                        }
+                        await Task.WhenAll(hostTasks);
+                    }
+
+                    // show IPv6 local addresses (no large IPv6 sweeps performed)
+                    if (localV6.Count > 0)
+                    {
+                        Console.WriteLine("Local IPv6 addresses:");
+                        foreach (var v6 in localV6) Console.WriteLine("  " + v6);
+                        Console.WriteLine("IPv6 network scanning is not performed by default due to large address space. Use explicit targets for IPv6 hosts.");
+                    }
+
+                    await Task.CompletedTask; return;
                 }
 
-                Console.WriteLine($"Scanning {saddr} ports {start}-{end}...");
-                for (int p = start; p <= end; p++)
+                // single-host scan: resolve to all address families and scan each address (IPv4 + IPv6)
+                string hostSingle = targetArg;
+                var argPorts = portsArg;
+                int explicitPortSingle = -1;
+                if (hostSingle.StartsWith("http://", StringComparison.OrdinalIgnoreCase) || hostSingle.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
                 {
-                    using var tc = new TcpClient();
-                    var task = tc.ConnectAsync(saddr, p);
-                    var completed = await Task.WhenAny(task, Task.Delay(300));
-                    if (completed == task && tc.Connected) Console.WriteLine($"{p}: open");
+                    try { var u = new Uri(hostSingle); hostSingle = u.Host; if (u.Port > 0) explicitPortSingle = u.Port; } catch { }
+                }
+                else if (hostSingle.IndexOf(':') > 0 && !hostSingle.Contains('/'))
+                {
+                    var sp = hostSingle.Split(':'); hostSingle = sp[0]; if (int.TryParse(sp[1], out var p)) explicitPortSingle = p;
+                }
+
+                Console.WriteLine($"Resolving: {hostSingle}...");
+                var addrsSingle = await Dns.GetHostAddressesAsync(hostSingle);
+                if (addrsSingle == null || addrsSingle.Length == 0) { Console.WriteLine("Could not resolve host"); await Task.CompletedTask; return; }
+                Console.WriteLine($"Resolved addresses: {string.Join(',', addrsSingle.Select(a => a.ToString() + "(" + a.AddressFamily + ")"))}");
+
+                // parse portsArg
+                var portsSingle = new List<int>();
+                foreach (var token in argPorts.Split(',', StringSplitOptions.RemoveEmptyEntries))
+                {
+                    var t = token.Trim();
+                    if (t.Contains('-'))
+                    {
+                        var p = t.Split('-', 2);
+                        if (int.TryParse(p[0], out var a) && int.TryParse(p[1], out var b)) { for (int i2 = Math.Min(a,b); i2 <= Math.Max(a,b); i2++) portsSingle.Add(i2); }
+                    }
+                    else if (int.TryParse(t, out var p)) portsSingle.Add(p);
+                }
+                if (explicitPortSingle > 0) { if (!portsSingle.Contains(explicitPortSingle)) portsSingle.Insert(0, explicitPortSingle); }
+                portsSingle = portsSingle.Distinct().Where(p => p >= 1 && p <= 65535).OrderBy(p => p).ToList();
+                if (portsSingle.Count == 0) { Console.WriteLine("No ports to scan."); await Task.CompletedTask; return; }
+
+                var wellKnownSingle = new Dictionary<int,string> { [22] = "ssh", [80] = "http", [443] = "https", [3389] = "rdp", [3306] = "mysql", [8080] = "http-alt", [53] = "dns", [21] = "ftp", [25] = "smtp", [445] = "microsoft-ds" };
+
+                // helper to detect private IPv4
+                static bool IsPrivateIPv4(IPAddress ip)
+                {
+                    if (ip.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork) return false;
+                    var b = ip.GetAddressBytes();
+                    // 10.0.0.0/8
+                    if (b[0] == 10) return true;
+                    // 172.16.0.0/12
+                    if (b[0] == 172 && b[1] >= 16 && b[1] <= 31) return true;
+                    // 192.168.0.0/16
+                    if (b[0] == 192 && b[1] == 168) return true;
+                    // loopback
+                    if (b[0] == 127) return true;
+                    return false;
+                }
+
+                foreach (var addr in addrsSingle)
+                {
+                    try
+                    {
+                        // if target is public IPv4 or global IPv6 and external scanning not allowed, require explicit consent
+                        bool isPublicIPv4 = addr.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork && !IsPrivateIPv4(addr);
+                        bool isGlobalIPv6 = addr.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6 && !(addr.IsIPv6LinkLocal || addr.IsIPv6SiteLocal || addr.IsIPv6Multicast);
+                        if ((isPublicIPv4 || isGlobalIPv6) && !allowExternal)
+                        {
+                            Console.WriteLine($"Address {addr} appears to be public. Scanning external hosts requires explicit permission and may be illegal without authorization.");
+                            Console.Write("Type 'I have permission' to proceed with scanning this external address: ");
+                            var consent = Console.ReadLine();
+                            if (consent == null || !consent.Trim().Equals("I have permission", StringComparison.Ordinal)) { Console.WriteLine("Skipped external address: " + addr); continue; }
+                        }
+
+                        Console.WriteLine($"Scanning address {addr} ({addr.AddressFamily})...");
+                        foreach (var port in portsSingle)
+                        {
+                            try
+                            {
+                                using var tc = new TcpClient(addr.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6 ? System.Net.Sockets.AddressFamily.InterNetworkV6 : System.Net.Sockets.AddressFamily.InterNetwork);
+                                var connectTask = tc.ConnectAsync(addr, port);
+                                var completed = await Task.WhenAny(connectTask, Task.Delay(700));
+                                if (completed == connectTask && tc.Connected)
+                                {
+                                    Console.Write($"{addr} {port}: open"); if (wellKnownSingle.TryGetValue(port, out var svc)) Console.Write($" ({svc})"); Console.WriteLine();
+                                    try
+                                    {
+                                        using var ns = tc.GetStream();
+                                        ns.ReadTimeout = 500; ns.WriteTimeout = 500;
+                                        if (port == 80 || port == 8080 || port == 8000)
+                                        {
+                                            var probe = Encoding.ASCII.GetBytes("HEAD / HTTP/1.0\r\nHost: " + hostSingle + "\r\n\r\n");
+                                            await ns.WriteAsync(probe, 0, probe.Length);
+                                        }
+                                        var buf = new byte[512];
+                                        var readTask = ns.ReadAsync(buf, 0, buf.Length);
+                                        var rcomp = await Task.WhenAny(readTask, Task.Delay(500));
+                                        if (rcomp == readTask && readTask.Result > 0)
+                                        {
+                                            var txt = Encoding.UTF8.GetString(buf, 0, readTask.Result);
+                                            var firstLine = txt.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "";
+                                            Console.WriteLine("  banner: " + (firstLine.Length>200? firstLine.Substring(0,200)+"...": firstLine));
+                                        }
+                                    }
+                                    catch { }
+                                }
+                                else
+                                {
+                                    Console.WriteLine($"{addr} {port}: closed");
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                Console.WriteLine($"{addr} {port}: error ({ex.Message})");
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Address {addr} scan error: {ex.Message}");
+                    }
                 }
             }
             catch (Exception ex) { Console.WriteLine("scan error: " + ex.Message); }
+            await Task.CompletedTask;
+        };
+
+        // whoamiip - show public IP
+        BuiltInCommands["whoamiip"] = async args =>
+        {
+            try
+            {
+                using var http = new HttpClient(); http.Timeout = TimeSpan.FromSeconds(5);
+                try { var ip = await http.GetStringAsync("https://api.ipify.org"); Console.WriteLine("Public IP: " + ip.Trim()); }
+                catch { var ip = await http.GetStringAsync("https://icanhazip.com"); Console.WriteLine("Public IP: " + ip.Trim()); }
+            }
+            catch (Exception ex) { Console.WriteLine("whoamiip error: " + ex.Message); }
+            await Task.CompletedTask;
+        };
+
+        // netstat - list listeners and established connections
+        BuiltInCommands["netstat"] = async args =>
+        {
+            try
+            {
+                var props = IPGlobalProperties.GetIPGlobalProperties();
+                var listeners = props.GetActiveTcpListeners();
+                Console.WriteLine("TCP Listeners:"); foreach (var l in listeners) Console.WriteLine($"  {l}");
+                var conns = props.GetActiveTcpConnections();
+                Console.WriteLine("TCP Connections:"); foreach (var c in conns) Console.WriteLine($"  {c.LocalEndPoint} -> {c.RemoteEndPoint} ({c.State})");
+            }
+            catch (Exception ex) { Console.WriteLine("netstat error: " + ex.Message); }
+            await Task.CompletedTask;
+        };
+
+        // discover - simple local subnet ping sweep (limited range)
+        BuiltInCommands["discover"] = async args =>
+        {
+            try
+            {
+                // find a local IPv4
+                string local = null;
+                foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (ni.OperationalStatus != OperationalStatus.Up) continue;
+                    foreach (var ua in ni.GetIPProperties().UnicastAddresses)
+                    {
+                        if (ua.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork && !IPAddress.IsLoopback(ua.Address)) { local = ua.Address.ToString(); break; }
+                    }
+                    if (local != null) break;
+                }
+                if (local == null) { Console.WriteLine("No local IPv4 address found."); await Task.CompletedTask; return; }
+                var parts = local.Split('.'); var prefix = string.Join('.', parts.Take(3)) + ".";
+                int max = 32; if (args.Length > 0 && int.TryParse(args[0], out var m)) max = Math.Min(254, Math.Max(4, m));
+                Console.WriteLine($"Pinging hosts {prefix}1-{prefix}{max} ...");
+                var tasks = new List<Task>(); var up = new List<string>();
+                var sem = new System.Threading.SemaphoreSlim(50);
+                for (int i = 1; i <= max; i++)
+                {
+                    var ip = prefix + i;
+                    await sem.WaitAsync();
+                    tasks.Add(Task.Run(async () =>
+                    {
+                        try
+                        {
+                            using var p = new Ping(); var r = await p.SendPingAsync(ip, 300);
+                            if (r.Status == IPStatus.Success) lock (up) { up.Add(ip); }
+                        }
+                        catch { }
+                        finally { sem.Release(); }
+                    }));
+                }
+                await Task.WhenAll(tasks);
+                Console.WriteLine("Up hosts:"); foreach (var h in up) Console.WriteLine("  " + h);
+            }
+            catch (Exception ex) { Console.WriteLine("discover error: " + ex.Message); }
             await Task.CompletedTask;
         };
 
@@ -1378,6 +1638,132 @@ class Program
             await Task.CompletedTask;
         };
 
+        // more small utilities
+        BuiltInCommands["env"] = async args =>
+        {
+            try
+            {
+                if (args.Length == 0)
+                {
+                    foreach (System.Collections.DictionaryEntry kv in Environment.GetEnvironmentVariables()) Console.WriteLine($"{kv.Key}={kv.Value}");
+                }
+                else
+                {
+                    var v = Environment.GetEnvironmentVariable(args[0]);
+                    Console.WriteLine(v ?? "(not set)");
+                }
+            }
+            catch (Exception ex) { Console.WriteLine("env error: " + ex.Message); }
+            await Task.CompletedTask;
+        };
+
+        BuiltInCommands["epoch"] = async args =>
+        {
+            try
+            {
+                if (args.Length == 0) { var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds(); Console.WriteLine(now); await Task.CompletedTask; return; }
+                if (args[0].Equals("to", StringComparison.OrdinalIgnoreCase) && args.Length > 1 && long.TryParse(args[1], out var secs))
+                {
+                    var dt = DateTimeOffset.FromUnixTimeSeconds(secs).ToLocalTime(); Console.WriteLine(dt.ToString()); await Task.CompletedTask; return;
+                }
+                if (args[0].Equals("from", StringComparison.OrdinalIgnoreCase) && args.Length > 1 && DateTimeOffset.TryParse(string.Join(' ', args.Skip(1)), out var dto))
+                {
+                    Console.WriteLine(dto.ToUnixTimeSeconds()); await Task.CompletedTask; return;
+                }
+                Console.WriteLine("Usage: epoch [to <seconds>|from <date>] or no args to print now");
+            }
+            catch (Exception ex) { Console.WriteLine("epoch error: " + ex.Message); }
+            await Task.CompletedTask;
+        };
+
+        BuiltInCommands["randstr"] = async args =>
+        {
+            try
+            {
+                int len = 24; if (args.Length > 0) int.TryParse(args[0], out len);
+                if (len < 1) len = 1; if (len > 4096) len = 4096;
+                var buf = new byte[len]; using var rng = RandomNumberGenerator.Create(); rng.GetBytes(buf);
+                // base64url-safe
+                var s = Convert.ToBase64String(buf).TrimEnd('='); s = s.Replace('+', '-').Replace('/', '_');
+                Console.WriteLine(s.Substring(0, Math.Min(s.Length, len)));
+            }
+            catch (Exception ex) { Console.WriteLine("randstr error: " + ex.Message); }
+            await Task.CompletedTask;
+        };
+
+        BuiltInCommands["extract"] = async args =>
+        {
+            if (args.Length < 2) { Console.WriteLine("Usage: extract <zip> <outDir>"); await Task.CompletedTask; return; }
+            try
+            {
+                var zip = args[0]; var outd = args[1]; if (!Path.IsPathRooted(zip)) zip = Path.Combine(CurrentDirectory, zip); if (!Path.IsPathRooted(outd)) outd = Path.Combine(CurrentDirectory, outd);
+                if (!File.Exists(zip)) { Console.WriteLine("Zip not found: " + zip); await Task.CompletedTask; return; }
+                Directory.CreateDirectory(outd);
+                ZipFile.ExtractToDirectory(zip, outd);
+                Console.WriteLine("Extracted to " + outd);
+            }
+            catch (Exception ex) { Console.WriteLine("extract error: " + ex.Message); }
+            await Task.CompletedTask;
+        };
+
+        // hacker - fun Matrix-style green text simulation
+        BuiltInCommands["hacker"] = async args =>
+        {
+            try
+            {
+                // determine seconds to run: prefer first arg; otherwise prompt the user
+                int seconds = 5;
+                if (args.Length > 0)
+                {
+                    int.TryParse(args[0], out seconds);
+                }
+                else
+                {
+                    Console.Write("Enter duration in seconds (default 5): ");
+                    var input = Console.ReadLine();
+                    if (!string.IsNullOrWhiteSpace(input) && int.TryParse(input.Trim(), out var parsed)) seconds = parsed;
+                }
+                if (seconds <= 0) seconds = 5;
+
+                var chars = "abcdefghijklmnopqrstuvwxyz0123456789@#$%&*()-_=+<>?/\\|";
+                var rand = new Random();
+                var sw = Stopwatch.StartNew();
+                var prevColor = Console.ForegroundColor;
+                try
+                {
+                    Console.Clear();
+                    while (sw.ElapsedMilliseconds < seconds * 1000)
+                    {
+                        int width = 80;
+                        int height = 24;
+                        try { width = Math.Max(10, Console.WindowWidth - 1); height = Math.Max(4, Console.WindowHeight); } catch { }
+
+                        // print a small random block of lines
+                        int lines = rand.Next(1, Math.Max(2, Math.Min(6, height / 4)));
+                        for (int i = 0; i < lines; i++)
+                        {
+                            var sb = new StringBuilder();
+                            int len = rand.Next(10, Math.Max(10, width));
+                            for (int j = 0; j < len; j++) sb.Append(chars[rand.Next(chars.Length)]);
+                            Console.ForegroundColor = ConsoleColor.Green;
+                            Console.WriteLine(sb.ToString());
+                        }
+
+                        // small pause to create falling effect
+                        await Task.Delay(rand.Next(30, 120));
+                    }
+                }
+                finally
+                {
+                    Console.ForegroundColor = prevColor;
+                    Console.WriteLine();
+                    Console.WriteLine("[hacker] simulation complete.");
+                }
+            }
+            catch (Exception ex) { Console.WriteLine("hacker error: " + ex.Message); }
+            await Task.CompletedTask;
+        };
+
         // passthrough aliases removed
     }
     static async Task<int> Main()
@@ -1664,11 +2050,15 @@ class Program
         // Minimal ASCII banner inspired by Kali style
         Console.ForegroundColor = ConsoleColor.Green;
         Console.WriteLine("|   _______    |");
-        Console.ForegroundColor = ConsoleColor.Green;
+        Console.ForegroundColor = ConsoleColor.Blue;
         Console.WriteLine("|  |__   __|   |");
+        Console.ForegroundColor = ConsoleColor.Red;
         Console.WriteLine("|     | |      |");
+        Console.ForegroundColor = ConsoleColor.Yellow;
         Console.WriteLine("|     | |      |");
+        Console.ForegroundColor = ConsoleColor.Magenta;
         Console.WriteLine("|     | |      |");
+        Console.ForegroundColor = ConsoleColor.White;
         Console.WriteLine("|     |_|      |");
         Console.ResetColor();
         Console.WriteLine();
