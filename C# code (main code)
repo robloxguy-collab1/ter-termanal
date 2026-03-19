@@ -15,6 +15,7 @@ using System.IO;
 using System.IO.Compression;
 using System.Text.Json;
 using System.Threading.Tasks;
+using System.Text.RegularExpressions;
 
 class Program
 {
@@ -23,6 +24,110 @@ class Program
     static List<string> History = new List<string>();
     static Dictionary<string, Func<string[], Task>> BuiltInCommands = new Dictionary<string, Func<string[], Task>>(StringComparer.OrdinalIgnoreCase);
 
+    // User command helpers (class-level so they are visible to InitializeBuiltIns)
+    static void LoadUserCommands()
+    {
+        try
+        {
+            var root = Path.Combine(CurrentDirectory, "cmdsforter");
+            if (!Directory.Exists(root)) return;
+            foreach (var d in Directory.GetDirectories(root))
+            {
+                var name = Path.GetFileName(d);
+                if (string.IsNullOrWhiteSpace(name)) continue;
+                RegisterUserCommand(name, d);
+            }
+        }
+        catch { }
+    }
+
+    static void RegisterUserCommand(string name, string folderPath)
+    {
+        BuiltInCommands[name] = async args =>
+        {
+            try
+            {
+                if (!Directory.Exists(folderPath)) { Console.WriteLine("Command folder missing: " + folderPath); await Task.CompletedTask; return; }
+                var script = FindRunScriptInFolder(folderPath);
+                if (script == null) { Console.WriteLine("No runnable script found in command folder: " + folderPath); await Task.CompletedTask; return; }
+
+                string JoinArgs(string[] a)
+                {
+                    if (a == null || a.Length == 0) return string.Empty;
+                    return string.Join(' ', a.Select(s => QuoteArg(s)));
+                }
+
+                var argstr = JoinArgs(args);
+                var isWin = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+                string cmd;
+                var ext = Path.GetExtension(script).ToLowerInvariant();
+                if (isWin)
+                {
+                    if (ext == ".ps1") cmd = $"powershell -NoProfile -ExecutionPolicy Bypass -File {QuoteArg(script)} {argstr}";
+                    else cmd = QuoteArg(script) + (string.IsNullOrEmpty(argstr) ? string.Empty : " " + argstr);
+                }
+                else
+                {
+                    cmd = QuoteArg(script) + (string.IsNullOrEmpty(argstr) ? string.Empty : " " + argstr);
+                }
+
+                await RunExternalAsync(cmd);
+            }
+            catch (Exception ex) { Console.WriteLine($"{name} error: " + ex.Message); }
+            await Task.CompletedTask;
+        };
+    }
+
+    static string FindRunScriptInFolder(string folder)
+    {
+        var candidates = new[] { "run", "run.sh", "run.bat", "run.cmd", "run.ps1", "run.exe" };
+        foreach (var c in candidates)
+        {
+            var p = Path.Combine(folder, c);
+            if (File.Exists(p)) return p;
+        }
+        var exts = new[] { ".sh", ".py", ".ps1", ".exe", ".bat", ".cmd" };
+        foreach (var f in Directory.GetFiles(folder))
+        {
+            var e = Path.GetExtension(f).ToLowerInvariant();
+            if (exts.Contains(e)) return f;
+        }
+        return Directory.GetFiles(folder).FirstOrDefault();
+    }
+
+    static string QuoteArg(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return "\"\"";
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            if (s.Contains(' ')) return "\"" + s + "\"";
+            return s;
+        }
+        if (!s.Contains('\'')) return "'" + s + "'";
+        return '"' + s.Replace("\"", "\\\"") + '"';
+    }
+    
+    // Default search roots used by search/findtext when broad search requested
+    static IEnumerable<string> GetDefaultSearchRoots()
+    {
+        var roots = new List<string>();
+        try
+        {
+            var user = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            if (!string.IsNullOrEmpty(CurrentDirectory)) roots.Add(CurrentDirectory);
+            var desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+            if (!string.IsNullOrEmpty(desktop)) roots.Add(desktop);
+            if (!string.IsNullOrEmpty(user)) roots.Add(user);
+            var downloads = Path.Combine(user ?? string.Empty, "Downloads"); if (!string.IsNullOrEmpty(downloads)) roots.Add(downloads);
+            var docs = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments); if (!string.IsNullOrEmpty(docs)) roots.Add(docs);
+            var pics = Environment.GetFolderPath(Environment.SpecialFolder.MyPictures); if (!string.IsNullOrEmpty(pics)) roots.Add(pics);
+            var music = Environment.GetFolderPath(Environment.SpecialFolder.MyMusic); if (!string.IsNullOrEmpty(music)) roots.Add(music);
+            var vids = Environment.GetFolderPath(Environment.SpecialFolder.MyVideos); if (!string.IsNullOrEmpty(vids)) roots.Add(vids);
+            foreach (var d in DriveInfo.GetDrives()) { try { if (d.IsReady && !string.IsNullOrEmpty(d.RootDirectory?.FullName)) roots.Add(d.RootDirectory.FullName); } catch { } }
+        }
+        catch { }
+        return roots.Where(r => !string.IsNullOrEmpty(r)).Distinct(StringComparer.OrdinalIgnoreCase);
+    }
 
 
     static async Task<int> RunExternalAsync(string command)
@@ -63,6 +168,8 @@ class Program
                     try { await writer.WriteLineAsync(line); } catch { break; }
                 }
             }
+
+    
 
 
     
@@ -181,6 +288,1097 @@ class Program
         {
             Console.WriteLine("Built-in commands:");
             foreach (var k in BuiltInCommands.Keys.OrderBy(k => k)) Console.WriteLine("  " + k);
+            await Task.CompletedTask;
+        };
+
+        // User command extensions: load commands from ./cmdsforter and allow creating new ones
+        BuiltInCommands["makecmd"] = async args =>
+        {
+            if (args.Length == 0) { Console.WriteLine("Usage: makecmd <folder-path> [cmdname]"); await Task.CompletedTask; return; }
+            try
+            {
+                var folder = args[0];
+                if (!Path.IsPathRooted(folder)) folder = Path.GetFullPath(Path.Combine(CurrentDirectory, folder));
+                if (!Directory.Exists(folder)) { Console.WriteLine("Folder not found: " + folder); await Task.CompletedTask; return; }
+                var cmdName = args.Length > 1 ? args[1] : Path.GetFileName(folder.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+                if (string.IsNullOrWhiteSpace(cmdName)) { Console.WriteLine("Invalid command name"); await Task.CompletedTask; return; }
+                var destRoot = Path.Combine(CurrentDirectory, "cmdsforter"); Directory.CreateDirectory(destRoot);
+                var dest = Path.Combine(destRoot, cmdName);
+                if (Directory.Exists(dest))
+                {
+                    Console.WriteLine($"Command folder already exists at {dest}. Overwrite? (y/N): ");
+                    var yn = Console.ReadLine(); if (string.IsNullOrEmpty(yn) || !yn.Trim().StartsWith("y", StringComparison.OrdinalIgnoreCase)) { Console.WriteLine("Aborted."); await Task.CompletedTask; return; }
+                    try { Directory.Delete(dest, true); } catch { }
+                }
+                // copy folder
+                CopyDirectory(folder, dest);
+                // register in-memory
+                RegisterUserCommand(cmdName, dest);
+                Console.WriteLine($"Created command '{cmdName}' from {folder} and registered it. Use '{cmdName} [args]' to run.");
+            }
+            catch (Exception ex) { Console.WriteLine("makecmd error: " + ex.Message); }
+            await Task.CompletedTask;
+        };
+
+        BuiltInCommands["reload-cmds"] = async args => { LoadUserCommands(); Console.WriteLine("Reloaded user commands from ./cmdsforter"); await Task.CompletedTask; };
+        BuiltInCommands["list-cmds"] = async args =>
+        {
+            try
+            {
+                var root = Path.Combine(CurrentDirectory, "cmdsforter"); if (!Directory.Exists(root)) { Console.WriteLine("No ./cmdsforter folder found."); await Task.CompletedTask; return; }
+                foreach (var d in Directory.GetDirectories(root)) Console.WriteLine(Path.GetFileName(d));
+            }
+            catch (Exception ex) { Console.WriteLine("list-cmds error: " + ex.Message); }
+            await Task.CompletedTask;
+        };
+
+        // Load user commands at initialization
+        LoadUserCommands();
+
+        // rndcode - custom encoder/decoder that produces highly random-looking codes but are reversible.
+        // Usage:
+        //   rndcode encode [--password <pw>] [--compress] <text>
+        //   rndcode decode [--password <pw>] <code>
+        BuiltInCommands["rndcode"] = async args =>
+        {
+            if (args.Length < 2) { Console.WriteLine("Usage: rndcode encode|decode [--password <pw>] [--compress] <text>"); await Task.CompletedTask; return; }
+            try
+            {
+                var list = args.ToList();
+                var mode = list[0].ToLowerInvariant();
+                string password = null; bool compress = false;
+                for (int i = 1; i < list.Count; i++)
+                {
+                    if (list[i] == "--password" && i + 1 < list.Count) { password = list[i + 1]; list[i] = null; list[i + 1] = null; i++; }
+                    else if (list[i] == "--compress") { compress = true; list[i] = null; }
+                }
+                var remaining = list.Where(s => !string.IsNullOrEmpty(s)).Skip(1).ToArray();
+                if (remaining.Length == 0) { Console.WriteLine("Missing text argument"); await Task.CompletedTask; return; }
+                var text = string.Join(' ', remaining);
+
+                string base64UrlEncode(byte[] data)
+                {
+                    var s = Convert.ToBase64String(data);
+                    s = s.TrimEnd('='); s = s.Replace('+', '-').Replace('/', '_');
+                    return s;
+                }
+                byte[] base64UrlDecode(string s)
+                {
+                    s = s.Replace('-', '+').Replace('_', '/');
+                    int pad = (4 - s.Length % 4) % 4; s = s + new string('=', pad);
+                    return Convert.FromBase64String(s);
+                }
+
+                byte[] CompressIfNeeded(byte[] input)
+                {
+                    if (!compress) return input;
+                    using var ms = new MemoryStream(); using (var gz = new GZipStream(ms, CompressionLevel.Optimal, true)) { gz.Write(input, 0, input.Length); }
+                    return ms.ToArray();
+                }
+                byte[] DecompressIfNeeded(byte[] input)
+                {
+                    try { using var inMs = new MemoryStream(input); using var gz = new GZipStream(inMs, CompressionMode.Decompress); using var outMs = new MemoryStream(); gz.CopyTo(outMs); return outMs.ToArray(); } catch { return input; }
+                }
+
+                if (mode == "encode")
+                {
+                    var plain = Encoding.UTF8.GetBytes(text);
+                    var payload = CompressIfNeeded(plain);
+
+                    // If password provided, encrypt payload using AES-GCM and include metadata
+                    byte[] raw;
+                    bool encrypted = false;
+                    if (!string.IsNullOrEmpty(password))
+                    {
+                        encrypted = true;
+                        var salt = new byte[16]; RandomNumberGenerator.Fill(salt);
+                        using var kdf = new Rfc2898DeriveBytes(password, salt, 200_000, HashAlgorithmName.SHA256);
+                        var key = kdf.GetBytes(32);
+                        var nonce = new byte[12]; RandomNumberGenerator.Fill(nonce);
+                        var cipher = new byte[payload.Length]; var tag = new byte[16];
+                        using (var aesg = new AesGcm(key)) { aesg.Encrypt(nonce, payload, cipher, tag); }
+                        // raw format: [ENCRYPTED(1)][salt(16)][nonce(12)][tag(16)][cipher]
+                        using var ms = new MemoryStream(); ms.WriteByte(1); ms.Write(salt, 0, salt.Length); ms.Write(nonce, 0, nonce.Length); ms.Write(tag, 0, tag.Length); ms.Write(cipher, 0, cipher.Length); raw = ms.ToArray();
+                        Array.Clear(key, 0, key.Length);
+                    }
+                    else
+                    {
+                        // raw: [ENCRYPTED(0)][payload]
+                        using var ms = new MemoryStream(); ms.WriteByte(0); ms.Write(payload, 0, payload.Length); raw = ms.ToArray();
+                    }
+
+                    // base64url encode raw
+                    var b64 = base64UrlEncode(raw);
+
+                    // create short token (8 chars) used to deterministically insert noise
+                    var tokenBytes = new byte[6]; RandomNumberGenerator.Fill(tokenBytes);
+                    var token = BitConverter.ToString(tokenBytes).Replace("-", ""); // 12 hex chars
+
+                    // determine noise parameters from token hash
+                    byte[] tokenHash;
+                    using (var sha = SHA256.Create()) tokenHash = sha.ComputeHash(Encoding.UTF8.GetBytes(token));
+                    int N = 3 + (tokenHash[0] % 6); // 3..8 inserts
+                    int L = 3 + (tokenHash[1] % 6); // 3..8 length
+                    var alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+                    var M = b64.Length;
+                    var sb = new StringBuilder(b64);
+
+                    // compute positions relative to original length M
+                    var positions = new List<int>();
+                    for (int i = 0; i < N; i++)
+                    {
+                        using var sha = SHA256.Create(); var h = sha.ComputeHash(Encoding.UTF8.GetBytes(token + ":" + i));
+                        var val = BitConverter.ToUInt32(h, 0); var pos = (int)(val % (uint)Math.Max(1, M)); positions.Add(pos);
+                    }
+
+                    // perform insertions in ascending i, inserting at pos + i*L
+                    var outSb = new StringBuilder(b64);
+                    for (int i = 0; i < N; i++)
+                    {
+                        int insertAt = positions[i] + i * L;
+                        if (insertAt < 0) insertAt = 0; if (insertAt > outSb.Length) insertAt = outSb.Length;
+                        // deterministic noise content derived from token+i
+                        using var sha2 = SHA256.Create(); var h2 = sha2.ComputeHash(Encoding.UTF8.GetBytes(token + "#" + i));
+                        var noise = new char[L]; for (int j = 0; j < L; j++) noise[j] = alphabet[h2[j] % alphabet.Length];
+                        outSb.Insert(insertAt, new string(noise));
+                    }
+
+                    var final = "RC1" + token + outSb.ToString();
+                    Console.WriteLine(final);
+                    await Task.CompletedTask; return;
+                }
+                else if (mode == "decode")
+                {
+                    var code = text;
+                    if (!code.StartsWith("RC1") || code.Length <= 3 + 12) { Console.WriteLine("Invalid rndcode format"); await Task.CompletedTask; return; }
+                    var token = code.Substring(3, 12); var obf = code.Substring(15);
+                    byte[] tokenHash;
+                    using (var sha = SHA256.Create()) tokenHash = sha.ComputeHash(Encoding.UTF8.GetBytes(token));
+                    int N = 3 + (tokenHash[0] % 6); int L = 3 + (tokenHash[1] % 6);
+                    int F = obf.Length; int M = F - N * L; if (M < 0) { Console.WriteLine("Invalid code (too short)"); await Task.CompletedTask; return; }
+
+                    // recompute positions
+                    var positions = new List<int>();
+                    for (int i = 0; i < N; i++) { using var sha = SHA256.Create(); var h = sha.ComputeHash(Encoding.UTF8.GetBytes(token + ":" + i)); var val = BitConverter.ToUInt32(h, 0); var pos = (int)(val % (uint)Math.Max(1, M)); positions.Add(pos); }
+
+                    var sb = new StringBuilder(obf);
+                    // remove inserted blocks in reverse order
+                    for (int i = N - 1; i >= 0; i--)
+                    {
+                        int idx = positions[i] + i * L;
+                        if (idx < 0) idx = 0; if (idx + L > sb.Length) { Console.WriteLine("Corrupt code"); await Task.CompletedTask; return; }
+                        sb.Remove(idx, L);
+                    }
+
+                    var b64 = sb.ToString();
+                    byte[] raw;
+                    try { raw = base64UrlDecode(b64); }
+                    catch { Console.WriteLine("Base64 decode failed"); await Task.CompletedTask; return; }
+
+                    if (raw.Length < 1) { Console.WriteLine("Invalid payload"); await Task.CompletedTask; return; }
+                    bool encrypted = raw[0] == 1;
+                    byte[] payload;
+                    if (encrypted)
+                    {
+                        if (raw.Length < 1 + 16 + 12 + 16) { Console.WriteLine("Invalid encrypted payload"); await Task.CompletedTask; return; }
+                        var pos = 1;
+                        var salt = raw.Skip(pos).Take(16).ToArray(); pos += 16;
+                        var nonce = raw.Skip(pos).Take(12).ToArray(); pos += 12;
+                        var tag = raw.Skip(pos).Take(16).ToArray(); pos += 16;
+                        var cipher = raw.Skip(pos).ToArray();
+                        if (string.IsNullOrEmpty(password)) { Console.Write("Password: "); password = Console.ReadLine(); }
+                        using var kdf = new Rfc2898DeriveBytes(password, salt, 200_000, HashAlgorithmName.SHA256); var key = kdf.GetBytes(32);
+                        var plain = new byte[cipher.Length];
+                        try { using var aesg = new AesGcm(key); aesg.Decrypt(nonce, cipher, tag, plain); payload = plain; }
+                        catch (Exception ex) { Console.WriteLine("Decryption failed: " + ex.Message); await Task.CompletedTask; return; }
+                        finally { Array.Clear(key, 0, key.Length); }
+                    }
+                    else
+                    {
+                        payload = raw.Skip(1).ToArray();
+                    }
+
+                    var dec = DecompressIfNeeded(payload);
+                    Console.WriteLine(Encoding.UTF8.GetString(dec));
+                    await Task.CompletedTask; return;
+                }
+                else Console.WriteLine("Usage: rndcode encode|decode [--password <pw>] [--compress] <text>");
+            }
+            catch (Exception ex) { Console.WriteLine("tercode error: " + ex.Message); }
+            await Task.CompletedTask;
+        };
+
+        // tercode - stronger encoder/decoder producing highly random-looking reversible codes.
+        // Usage:
+        //   tercode encode [--password <pw>] [--compress] <text>
+        //   tercode decode [--password <pw>] <code>
+        BuiltInCommands["tercode"] = async args =>
+        {
+            if (args.Length < 2) { Console.WriteLine("Usage: tercode encode|decode [--password <pw>] [--compress] [--base64] [--wrap] <text>"); await Task.CompletedTask; return; }
+            try
+            {
+                var list = args.ToList();
+                var mode = list[0].ToLowerInvariant();
+                string password = null; bool compress = false; bool base64flag = false; bool wrap = false;
+                int layers = 0;
+                for (int i = 1; i < list.Count; i++)
+                {
+                    if (list[i] == "--password" && i + 1 < list.Count) { password = list[i + 1]; list[i] = null; list[i + 1] = null; i++; }
+                    else if (list[i] == "--compress") { compress = true; list[i] = null; }
+                    else if (list[i] == "--base64") { base64flag = true; list[i] = null; }
+                    else if (list[i] == "--wrap") { wrap = true; list[i] = null; }
+                    else if (list[i] == "--layers" && i + 1 < list.Count && int.TryParse(list[i + 1], out var lv)) { layers = Math.Max(0, lv); list[i] = null; list[i + 1] = null; i++; }
+                }
+                var remaining = list.Where(s => !string.IsNullOrEmpty(s)).Skip(1).ToArray();
+                if (remaining.Length == 0) { Console.WriteLine("Missing text argument"); await Task.CompletedTask; return; }
+                var text = string.Join(' ', remaining);
+
+                static string Base64UrlEncode(byte[] data)
+                {
+                    var s = Convert.ToBase64String(data);
+                    s = s.TrimEnd('='); s = s.Replace('+', '-').Replace('/', '_');
+                    return s;
+                }
+                static byte[] Base64UrlDecode(string s)
+                {
+                    s = s.Replace('-', '+').Replace('_', '/');
+                    int pad = (4 - s.Length % 4) % 4; s = s + new string('=', pad);
+                    return Convert.FromBase64String(s);
+                }
+
+                byte[] CompressIfNeeded(byte[] input)
+                {
+                    if (!compress) return input;
+                    using var ms = new MemoryStream(); using (var gz = new GZipStream(ms, CompressionLevel.Optimal, true)) { gz.Write(input, 0, input.Length); }
+                    return ms.ToArray();
+                }
+                byte[] DecompressIfNeeded(byte[] input)
+                {
+                    try { using var inMs = new MemoryStream(input); using var gz = new GZipStream(inMs, CompressionMode.Decompress); using var outMs = new MemoryStream(); gz.CopyTo(outMs); return outMs.ToArray(); } catch { return input; }
+                }
+
+                if (mode == "encode")
+                {
+                    // optional base64-encode the input before further processing (makes ciphertext opaque ascii)
+                    var textToProcess = base64flag ? Convert.ToBase64String(Encoding.UTF8.GetBytes(text)) : text;
+                    var plain = Encoding.UTF8.GetBytes(textToProcess);
+                    var payload = CompressIfNeeded(plain);
+
+                    byte[] raw;
+                    if (!string.IsNullOrEmpty(password))
+                    {
+                        var salt = new byte[32]; RandomNumberGenerator.Fill(salt);
+                        using var kdf = new Rfc2898DeriveBytes(password, salt, 500_000, HashAlgorithmName.SHA256);
+                        var key = kdf.GetBytes(32);
+                        var nonce = new byte[12]; RandomNumberGenerator.Fill(nonce);
+                        var cipher = new byte[payload.Length]; var tag = new byte[16];
+                        using (var aesg = new AesGcm(key)) { aesg.Encrypt(nonce, payload, cipher, tag); }
+                        using var ms = new MemoryStream();
+                        ms.Write(Encoding.ASCII.GetBytes("TC2"), 0, 3);
+                        ms.WriteByte((byte)salt.Length); ms.Write(salt, 0, salt.Length);
+                        ms.WriteByte((byte)nonce.Length); ms.Write(nonce, 0, nonce.Length);
+                        ms.WriteByte((byte)tag.Length); ms.Write(tag, 0, tag.Length);
+                        ms.Write(cipher, 0, cipher.Length);
+                        raw = ms.ToArray();
+                        Array.Clear(key, 0, key.Length);
+                    }
+                    else
+                    {
+                        using var ms = new MemoryStream(); ms.Write(Encoding.ASCII.GetBytes("TC2"), 0, 3); ms.WriteByte(0); ms.Write(payload, 0, payload.Length); raw = ms.ToArray();
+                    }
+
+                    var b64 = Base64UrlEncode(raw);
+
+                    // stronger primary obfuscation: deterministic chunk permutation then noise insertions
+                    var tokenBytes = new byte[16]; RandomNumberGenerator.Fill(tokenBytes);
+                    var token = BitConverter.ToString(tokenBytes).Replace("-", "");
+                    byte[] tokenHash;
+                    using (var sha = SHA256.Create()) tokenHash = sha.ComputeHash(Encoding.UTF8.GetBytes(token));
+
+                    // permutation: split into chunks (chunkSize deterministic from tokenHash) and perform Fisher-Yates shuffle seeded by token
+                    int chunkSize = 4 + (tokenHash[2] % 8); // 4..11
+                    var chunks = new List<string>();
+                    for (int i = 0; i < b64.Length; i += chunkSize) chunks.Add(b64.Substring(i, Math.Min(chunkSize, b64.Length - i)));
+                    int n = chunks.Count;
+                    var indices = Enumerable.Range(0, n).ToArray();
+                    int ctr = 0;
+                    for (int i = n - 1; i > 0; i--)
+                    {
+                        using var sha2 = SHA256.Create(); var h = sha2.ComputeHash(Encoding.UTF8.GetBytes(token + "|rnd|" + ctr)); ctr++;
+                        var val = BitConverter.ToUInt32(h, 0); var r = (int)(val % (uint)(i + 1)); var tmp = indices[i]; indices[i] = indices[r]; indices[r] = tmp;
+                    }
+                    var permutedSb = new StringBuilder();
+                    for (int i = 0; i < n; i++) permutedSb.Append(chunks[indices[i]]);
+                    var permuted = permutedSb.ToString();
+
+                    // noise insertion on permuted data
+                    int N = 5 + (tokenHash[0] % 8);
+                    var alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+                    int M = permuted.Length;
+                    var lengths = new List<int>();
+                    var positions = new List<int>();
+                    for (int i = 0; i < N; i++)
+                    {
+                        int L = 4 + (tokenHash[1 + (i % (tokenHash.Length - 1))] % 9);
+                        lengths.Add(L);
+                        using var sha3 = SHA256.Create(); var hpos = sha3.ComputeHash(Encoding.UTF8.GetBytes(token + ":" + i));
+                        var val = BitConverter.ToUInt32(hpos, 0); var pos = (int)(val % (uint)Math.Max(1, M)); positions.Add(pos);
+                    }
+
+                    var outSb = new StringBuilder(permuted);
+                    for (int i = 0; i < N; i++)
+                    {
+                        int insertAt = positions[i] + i * lengths[i];
+                        if (insertAt < 0) insertAt = 0; if (insertAt > outSb.Length) insertAt = outSb.Length;
+                        using var sha4 = SHA256.Create(); var h4 = sha4.ComputeHash(Encoding.UTF8.GetBytes(token + "#" + i));
+                        var noise = new char[lengths[i]]; for (int j = 0; j < lengths[i]; j++) noise[j] = alphabet[h4[j % h4.Length] % alphabet.Length];
+                        outSb.Insert(insertAt, new string(noise));
+                    }
+
+                    var primary = "TC2" + token + outSb.ToString();
+
+                    // optional extra wrapping: apply multiple additional obfuscation layers if requested
+                    if (wrap || layers > 0)
+                    {
+                        var wrapCount = layers > 0 ? layers : 1;
+                        var current = primary;
+                        for (int layer = 1; layer <= wrapCount; layer++)
+                        {
+                            var pBytes = Encoding.UTF8.GetBytes(current);
+                            var pStr = Convert.ToBase64String(pBytes).TrimEnd('='); // compact outer content
+
+                            // compute outer token
+                            var token2b = new byte[16]; RandomNumberGenerator.Fill(token2b);
+                            var token2 = BitConverter.ToString(token2b).Replace("-", "");
+                            byte[] th2; using (var sha4 = SHA256.Create()) th2 = sha4.ComputeHash(Encoding.UTF8.GetBytes(token2));
+                            int N2 = 3 + (th2[0] % 6);
+                            var lengths2 = new List<int>(); var positions2 = new List<int>(); int M2 = pStr.Length;
+                            for (int i = 0; i < N2; i++) { int L = 3 + (th2[1 + (i % (th2.Length - 1))] % 6); lengths2.Add(L); using var s = SHA256.Create(); var h = s.ComputeHash(Encoding.UTF8.GetBytes(token2 + ":" + i)); var val = BitConverter.ToUInt32(h, 0); positions2.Add((int)(val % (uint)Math.Max(1, M2))); }
+                            var out2 = new StringBuilder(pStr);
+                            for (int i = 0; i < N2; i++) { int insertAt = positions2[i] + i * lengths2[i]; if (insertAt < 0) insertAt = 0; if (insertAt > out2.Length) insertAt = out2.Length; using var s = SHA256.Create(); var h = s.ComputeHash(Encoding.UTF8.GetBytes(token2 + "#" + i)); var noise = new char[lengths2[i]]; for (int j = 0; j < lengths2[i]; j++) noise[j] = alphabet[h[j % h.Length] % alphabet.Length]; out2.Insert(insertAt, new string(noise)); }
+
+                            // header number increases with each wrap: TC3, TC4, ...
+                            var headerNum = 2 + layer;
+                            var header = "TC" + headerNum.ToString();
+                            current = header + token2 + out2.ToString();
+                        }
+
+                        Console.WriteLine(current);
+                        await Task.CompletedTask; return;
+                    }
+
+                    Console.WriteLine(primary);
+                    await Task.CompletedTask; return;
+                }
+                else if (mode == "decode")
+                {
+                    var code = text;
+                    // unwrap any outer TCx layers (TC3, TC4, ...) until we reach TC2 primary
+                    while (code.StartsWith("TC") && !code.StartsWith("TC2") && code.Length > 35)
+                    {
+                        var token2 = code.Substring(3, 32); var obf2 = code.Substring(35);
+                        byte[] th2; using (var sha = SHA256.Create()) th2 = sha.ComputeHash(Encoding.UTF8.GetBytes(token2));
+                        int N2 = 3 + (th2[0] % 6);
+                        var lengths2 = new List<int>(); for (int i = 0; i < N2; i++) lengths2.Add(3 + (th2[1 + (i % (th2.Length - 1))] % 6));
+                        int F2 = obf2.Length; int M2 = F2 - lengths2.Sum(); if (M2 < 0) { Console.WriteLine("Invalid code (too short)"); await Task.CompletedTask; return; }
+                        var positions2 = new List<int>(); for (int i = 0; i < N2; i++) { using var sha = SHA256.Create(); var h = sha.ComputeHash(Encoding.UTF8.GetBytes(token2 + ":" + i)); var val = BitConverter.ToUInt32(h, 0); positions2.Add((int)(val % (uint)Math.Max(1, M2))); }
+                        var sb2 = new StringBuilder(obf2);
+                        for (int i = N2 - 1; i >= 0; i--) { int idx = positions2[i] + i * lengths2[i]; if (idx < 0) idx = 0; if (idx + lengths2[i] > sb2.Length) { Console.WriteLine("Corrupt code"); await Task.CompletedTask; return; } sb2.Remove(idx, lengths2[i]); }
+                        // decode base64 to get inner string (previous layer)
+                        try { var primBytes = Convert.FromBase64String(sb2.ToString() + new string('=', (4 - sb2.Length % 4) % 4)); code = Encoding.UTF8.GetString(primBytes); } catch { Console.WriteLine("Outer unwrap failed"); await Task.CompletedTask; return; }
+                    }
+
+                    // now expect TC2 primary
+                    if (!code.StartsWith("TC2") || code.Length <= 3 + 32) { Console.WriteLine("Invalid tercode format"); await Task.CompletedTask; return; }
+                    var token = code.Substring(3, 32); var obf = code.Substring(35);
+                    byte[] tokenHash;
+                    using (var sha = SHA256.Create()) tokenHash = sha.ComputeHash(Encoding.UTF8.GetBytes(token));
+                    int N = 5 + (tokenHash[0] % 8);
+                    int F = obf.Length;
+                    var lengths = new List<int>();
+                    for (int i = 0; i < N; i++) lengths.Add(4 + (tokenHash[1 + (i % (tokenHash.Length - 1))] % 9));
+                    int M = F - lengths.Sum(); if (M < 0) { Console.WriteLine("Invalid code (too short)"); await Task.CompletedTask; return; }
+
+                    var positions = new List<int>();
+                    for (int i = 0; i < N; i++) { using var sha = SHA256.Create(); var h = sha.ComputeHash(Encoding.UTF8.GetBytes(token + ":" + i)); var val = BitConverter.ToUInt32(h, 0); var pos = (int)(val % (uint)Math.Max(1, M)); positions.Add(pos); }
+
+                    var sb = new StringBuilder(obf);
+                    for (int i = N - 1; i >= 0; i--)
+                    {
+                        int idx = positions[i] + i * lengths[i];
+                        if (idx < 0) idx = 0; if (idx + lengths[i] > sb.Length) { Console.WriteLine("Corrupt code"); await Task.CompletedTask; return; }
+                        sb.Remove(idx, lengths[i]);
+                    }
+
+                    var permutedB64 = sb.ToString();
+                    string b64 = null;
+                    // Try to robustly invert the chunk permutation. The encoder uses chunkSize = 4..11 derived from tokenHash[2].
+                    // If something mismatches (edge cases), try all candidate chunk sizes in that range until a valid base64 payload with TC2 header is recovered.
+                    for (int tryChunk = 4; tryChunk <= 11; tryChunk++)
+                    {
+                        try
+                        {
+                            int chunkSize = tryChunk;
+                            int n = (permutedB64.Length + chunkSize - 1) / chunkSize;
+                            if (n <= 0) continue;
+
+                            // recompute permutation indices
+                            var indices = Enumerable.Range(0, n).ToArray();
+                            int ctr = 0;
+                            for (int i = n - 1; i > 0; i--)
+                            {
+                                using var sha2 = SHA256.Create(); var h = sha2.ComputeHash(Encoding.UTF8.GetBytes(token + "|rnd|" + ctr)); ctr++;
+                                var val = BitConverter.ToUInt32(h, 0); var r = (int)(val % (uint)(i + 1)); var tmp = indices[i]; indices[i] = indices[r]; indices[r] = tmp;
+                            }
+
+                            int lastChunkSize = permutedB64.Length - (n - 1) * chunkSize;
+                            if (lastChunkSize <= 0) lastChunkSize = chunkSize;
+
+                            var permChunks = new string[n];
+                            int posPtr = 0;
+                            bool bad = false;
+                            for (int i = 0; i < n; i++)
+                            {
+                                int sizeForThisPermutedPos = (indices[i] == n - 1) ? lastChunkSize : chunkSize;
+                                if (posPtr + sizeForThisPermutedPos > permutedB64.Length) { bad = true; break; }
+                                permChunks[i] = permutedB64.Substring(posPtr, sizeForThisPermutedPos);
+                                posPtr += sizeForThisPermutedPos;
+                            }
+                            if (bad) continue;
+
+                            var origChunks = new string[n];
+                            for (int k = 0; k < n; k++) origChunks[indices[k]] = permChunks[k];
+                            var candidate = string.Concat(origChunks);
+
+                            // attempt base64url decode and check header
+                            try
+                            {
+                                var rawTry = Base64UrlDecode(candidate);
+                                if (rawTry.Length >= 3)
+                                {
+                                    var hdrTry = Encoding.ASCII.GetString(rawTry, 0, 3);
+                                    if (hdrTry == "TC2") { b64 = candidate; break; }
+                                }
+                            }
+                            catch { /* ignore and try next chunk size */ }
+                        }
+                        catch { continue; }
+                    }
+
+                    if (b64 == null) { Console.WriteLine("Failed to recover permuted payload"); await Task.CompletedTask; return; }
+                    byte[] raw;
+                    try { raw = Base64UrlDecode(b64); }
+                    catch { Console.WriteLine("Base64 decode failed"); await Task.CompletedTask; return; }
+
+                    if (raw.Length < 3) { Console.WriteLine("Invalid payload"); await Task.CompletedTask; return; }
+                    var hdr = Encoding.ASCII.GetString(raw, 0, 3);
+                    if (hdr != "TC2") { Console.WriteLine("Unknown payload header"); await Task.CompletedTask; return; }
+
+                    byte[] payload;
+                    if (raw[3] == 0)
+                    {
+                        payload = raw.Skip(4).ToArray();
+                    }
+                    else
+                    {
+                        int pos = 3;
+                        int saltLen = raw[pos++]; if (pos + saltLen > raw.Length) { Console.WriteLine("Invalid encrypted payload"); await Task.CompletedTask; return; }
+                        var salt = raw.Skip(pos).Take(saltLen).ToArray(); pos += saltLen;
+                        int nonceLen = raw[pos++]; var nonce = raw.Skip(pos).Take(nonceLen).ToArray(); pos += nonceLen;
+                        int tagLen = raw[pos++]; var tag = raw.Skip(pos).Take(tagLen).ToArray(); pos += tagLen;
+                        var cipher = raw.Skip(pos).ToArray();
+                        if (string.IsNullOrEmpty(password)) { Console.Write("Password: "); password = Console.ReadLine(); }
+                        using var kdf = new Rfc2898DeriveBytes(password, salt, 500_000, HashAlgorithmName.SHA256); var key = kdf.GetBytes(32);
+                        var plain = new byte[cipher.Length];
+                        try { using var aesg = new AesGcm(key); aesg.Decrypt(nonce, cipher, tag, plain); payload = plain; }
+                        catch (Exception ex) { Console.WriteLine("Decryption failed: " + ex.Message); await Task.CompletedTask; return; }
+                        finally { Array.Clear(key, 0, key.Length); }
+                    }
+
+                    var dec = DecompressIfNeeded(payload);
+                    // if original was base64flag-encoded, detect by trying to decode as base64; otherwise print raw
+                    try
+                    {
+                        var s = Encoding.UTF8.GetString(dec);
+                        // attempt base64 decode heuristic: contains only base64 chars and length mod 4
+                        if (s.Length > 0 && s.Trim().Length % 4 == 0 && s.Trim().All(c => "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=\r\n".Contains(c)))
+                        {
+                            try { var maybe = Convert.FromBase64String(s); Console.WriteLine(Encoding.UTF8.GetString(maybe)); await Task.CompletedTask; return; } catch { }
+                        }
+                        Console.WriteLine(s);
+                    }
+                    catch { Console.WriteLine("Failed to decode payload"); }
+                    await Task.CompletedTask; return;
+                }
+                else Console.WriteLine("Usage: tercode encode|decode [--password <pw>] [--compress] [--base64] [--wrap] <text>");
+            }
+            catch (Exception ex) { Console.WriteLine("tercode error: " + ex.Message); }
+            await Task.CompletedTask;
+        };
+
+        // macvendor <mac> - lookup MAC vendor string via public API
+        BuiltInCommands["macvendor"] = async args =>
+        {
+            if (args.Length == 0) { Console.WriteLine("Usage: macvendor <mac>"); await Task.CompletedTask; return; }
+            try
+            {
+                var mac = args[0]; using var http = new HttpClient(); http.Timeout = TimeSpan.FromSeconds(6);
+                var u = "https://api.macvendors.com/" + Uri.EscapeDataString(mac);
+                var resp = await http.GetAsync(u);
+                if (!resp.IsSuccessStatusCode) { Console.WriteLine("Lookup failed: " + resp.StatusCode); await Task.CompletedTask; return; }
+                var txt = await resp.Content.ReadAsStringAsync(); Console.WriteLine(txt.Trim());
+            }
+            catch (Exception ex) { Console.WriteLine("macvendor error: " + ex.Message); }
+            await Task.CompletedTask;
+        };
+
+        // arp - show ARP/neighbour table
+        BuiltInCommands["arp"] = async args =>
+        {
+            try
+            {
+                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                {
+                    await RunExternalAsync("arp -a");
+                }
+                else if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+                {
+                    await RunExternalAsync("arp -a");
+                }
+                else
+                {
+                    // Linux: try ip neigh then arp -n
+                    var ok = false;
+                    try { var code = await RunExternalAsync("ip neigh"); ok = code == 0; } catch { }
+                    if (!ok) await RunExternalAsync("arp -n");
+                }
+            }
+            catch (Exception ex) { Console.WriteLine("arp error: " + ex.Message); }
+            await Task.CompletedTask;
+        };
+
+        // gateway - show default gateway(s)
+        BuiltInCommands["gateway"] = async args =>
+        {
+            try
+            {
+                var gateways = new List<string>();
+                foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    try
+                    {
+                        var props = ni.GetIPProperties();
+                        foreach (var g in props.GatewayAddresses)
+                        {
+                            if (g?.Address != null) gateways.Add($"{ni.Name}: {g.Address}");
+                        }
+                    }
+                    catch { }
+                }
+                if (gateways.Count == 0) Console.WriteLine("No gateway found via NetworkInterface API."); else foreach (var g in gateways) Console.WriteLine(g);
+            }
+            catch (Exception ex) { Console.WriteLine("gateway error: " + ex.Message); }
+            await Task.CompletedTask;
+        };
+
+        // bandwidth-test <url> [bytes] - download up to bytes and report throughput (bytes default 1_000_000)
+        BuiltInCommands["bandwidth-test"] = async args =>
+        {
+            if (args.Length == 0) { Console.WriteLine("Usage: bandwidth-test <url> [bytes]"); await Task.CompletedTask; return; }
+            try
+            {
+                var url = args[0]; long maxBytes = 1_000_000;
+                if (args.Length > 1 && long.TryParse(args[1], out var mb)) maxBytes = Math.Max(1024, mb);
+                using var http = new HttpClient(); http.Timeout = TimeSpan.FromSeconds(30);
+                using var resp = await http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
+                if (!resp.IsSuccessStatusCode) { Console.WriteLine("Request failed: " + resp.StatusCode); await Task.CompletedTask; return; }
+                using var stream = await resp.Content.ReadAsStreamAsync();
+                var buf = new byte[8192]; long total = 0; var sw = Stopwatch.StartNew();
+                while (total < maxBytes)
+                {
+                    var toRead = (int)Math.Min(buf.Length, maxBytes - total);
+                    var read = await stream.ReadAsync(buf, 0, toRead);
+                    if (read <= 0) break;
+                    total += read;
+                }
+                sw.Stop();
+                var secs = Math.Max(0.0001, sw.Elapsed.TotalSeconds);
+                var mbps = (total * 8.0) / secs / 1_000_000.0;
+                Console.WriteLine($"Downloaded {total} bytes in {sw.Elapsed.TotalSeconds:F2}s -> {mbps:F2} Mbps");
+            }
+            catch (Exception ex) { Console.WriteLine("bandwidth-test error: " + ex.Message); }
+            await Task.CompletedTask;
+        };
+
+        // ssid-find / wifi-current - show information about the Wi-Fi network this host is currently connected to
+        BuiltInCommands["ssid-find"] = BuiltInCommands["wifi-current"] = async args =>
+        {
+            try
+            {
+                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                {
+                    var psi = new ProcessStartInfo("netsh", "wlan show interfaces") { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
+                    using var p = Process.Start(psi);
+                    if (p == null) { Console.WriteLine("Failed to run netsh"); await Task.CompletedTask; return; }
+                    var outp = await p.StandardOutput.ReadToEndAsync(); await p.WaitForExitAsync();
+                    // Print only relevant lines
+                    var lines = outp.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                    foreach (var l in lines)
+                    {
+                        if (l.TrimStart().StartsWith("SSID", StringComparison.OrdinalIgnoreCase) ||
+                            l.TrimStart().StartsWith("BSSID", StringComparison.OrdinalIgnoreCase) ||
+                            l.TrimStart().StartsWith("Signal", StringComparison.OrdinalIgnoreCase) ||
+                            l.TrimStart().StartsWith("Authentication", StringComparison.OrdinalIgnoreCase) ||
+                            l.TrimStart().StartsWith("Cipher", StringComparison.OrdinalIgnoreCase) ||
+                            l.TrimStart().StartsWith("Radio type", StringComparison.OrdinalIgnoreCase) ||
+                            l.TrimStart().StartsWith("Channel", StringComparison.OrdinalIgnoreCase) ||
+                            l.TrimStart().StartsWith("Receive rate", StringComparison.OrdinalIgnoreCase) ||
+                            l.TrimStart().StartsWith("Transmit rate", StringComparison.OrdinalIgnoreCase))
+                        {
+                            Console.WriteLine(l.Trim());
+                        }
+                    }
+                }
+                else if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+                {
+                    // Try airport for detailed info
+                    var airport = "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport";
+                    var psi = new ProcessStartInfo(airport, "-I") { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
+                    using var p = Process.Start(psi);
+                    if (p != null)
+                    {
+                        var outp = await p.StandardOutput.ReadToEndAsync(); await p.WaitForExitAsync();
+                        Console.WriteLine(outp.Trim());
+                    }
+                    else
+                    {
+                        // fallback to networksetup
+                        var psi2 = new ProcessStartInfo("networksetup", "-getairportnetwork en0") { RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true };
+                        using var p2 = Process.Start(psi2);
+                        if (p2 != null) { var o2 = await p2.StandardOutput.ReadToEndAsync(); await p2.WaitForExitAsync(); Console.WriteLine(o2.Trim()); }
+                    }
+                }
+                else
+                {
+                    // Linux: try nmcli, then iwgetid
+                    bool printed = false;
+                    try
+                    {
+                        var psi = new ProcessStartInfo("nmcli", "-t -f ACTIVE,SSID,BSSID,DEVICE,CHAN,FREQ,SIGNAL,SECURITY connection show --active") { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
+                        using var p = Process.Start(psi);
+                        if (p != null)
+                        {
+                            var outp = await p.StandardOutput.ReadToEndAsync(); await p.WaitForExitAsync();
+                            if (!string.IsNullOrWhiteSpace(outp))
+                            {
+                                // print entire output for user
+                                Console.WriteLine(outp.Trim());
+                                printed = true;
+                            }
+                        }
+                    }
+                    catch { }
+
+                    if (!printed)
+                    {
+                        // fallback: iwgetid for SSID and iwconfig for details
+                        try
+                        {
+                            var psiS = new ProcessStartInfo("iwgetid", "-r") { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
+                            using var ps = Process.Start(psiS);
+                            if (ps != null)
+                            {
+                                var ss = await ps.StandardOutput.ReadToEndAsync(); await ps.WaitForExitAsync(); ss = ss.Trim();
+                                if (!string.IsNullOrEmpty(ss)) Console.WriteLine("SSID: " + ss);
+                            }
+                        }
+                        catch { }
+
+                        try
+                        {
+                            var psi2 = new ProcessStartInfo("iwconfig") { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
+                            using var p2 = Process.Start(psi2);
+                            if (p2 != null)
+                            {
+                                var outp2 = await p2.StandardOutput.ReadToEndAsync(); await p2.WaitForExitAsync();
+                                Console.WriteLine(outp2.Trim());
+                            }
+                        }
+                        catch { }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("ssid-find error: " + ex.Message);
+            }
+            await Task.CompletedTask;
+        };
+
+        // locate <ip|host> or no args to locate current public IP - prints location details
+        BuiltInCommands["locate"] = async args =>
+        {
+            try
+            {
+                string ipStr = null;
+                if (args.Length == 0)
+                {
+                    // no argument: determine public IP for this machine
+                    try
+                    {
+                        using var httpPub = new HttpClient(); httpPub.Timeout = TimeSpan.FromSeconds(5);
+                        try { ipStr = (await httpPub.GetStringAsync("https://api.ipify.org")).Trim(); } catch { }
+                        if (string.IsNullOrEmpty(ipStr))
+                        {
+                            try { ipStr = (await httpPub.GetStringAsync("https://icanhazip.com")).Trim(); } catch { }
+                        }
+                        if (string.IsNullOrEmpty(ipStr)) { Console.WriteLine("unknown"); await Task.CompletedTask; return; }
+                    }
+                    catch { Console.WriteLine("unknown"); await Task.CompletedTask; return; }
+                }
+                else
+                {
+                    var target = args[0];
+                    ipStr = target;
+                    if (!IPAddress.TryParse(ipStr, out _))
+                    {
+                        try { var addrs = await Dns.GetHostAddressesAsync(ipStr); if (addrs != null && addrs.Length > 0) ipStr = addrs[0].ToString(); } catch { }
+                    }
+                }
+                // Helper: query multiple free geolocation services and combine results to improve accuracy
+                async Task<(double? lat, double? lon, double accuracyKm, List<string> sources)> GetBestCoordsAsync(string ip)
+                {
+                    var coords = new List<(double lat, double lon, string src, double weight)>();
+                    HttpClient CreateClient() => new HttpClient() { Timeout = TimeSpan.FromSeconds(4) };
+
+                    // helper to add if valid
+                    void AddCoord(double lat, double lon, string src, double weight = 1.0) { coords.Add((lat, lon, src, weight)); }
+
+                    // ip-api (reliable)
+                    try
+                    {
+                        using var h = CreateClient();
+                        var u = "http://ip-api.com/json/" + Uri.EscapeDataString(ip) + "?fields=status,lat,lon";
+                        using var r = await h.GetAsync(u);
+                        if (r.IsSuccessStatusCode)
+                        {
+                            var t = await r.Content.ReadAsStringAsync(); using var d = JsonDocument.Parse(t);
+                            var root = d.RootElement;
+                            if (root.TryGetProperty("status", out var st) && st.GetString() == "success")
+                            {
+                                if (root.TryGetProperty("lat", out var la) && root.TryGetProperty("lon", out var lo)) AddCoord(la.GetDouble(), lo.GetDouble(), "ip-api", 1.5);
+                            }
+                        }
+                    }
+                    catch { }
+
+                    // ipinfo (loc: "lat,lon")
+                    try
+                    {
+                        using var h = CreateClient(); using var r = await h.GetAsync($"https://ipinfo.io/{ip}/json");
+                        if (r.IsSuccessStatusCode)
+                        {
+                            var t = await r.Content.ReadAsStringAsync(); using var d = JsonDocument.Parse(t);
+                            var root = d.RootElement;
+                            if (root.TryGetProperty("loc", out var loc))
+                            {
+                                var s = loc.GetString(); if (!string.IsNullOrEmpty(s) && s.Contains(','))
+                                {
+                                    var p = s.Split(','); if (double.TryParse(p[0], out var la) && double.TryParse(p[1], out var lo)) AddCoord(la, lo, "ipinfo", 1.2);
+                                }
+                            }
+                        }
+                    }
+                    catch { }
+
+                    // ipapi.co
+                    try
+                    {
+                        using var h = CreateClient(); using var r = await h.GetAsync($"https://ipapi.co/{ip}/json/");
+                        if (r.IsSuccessStatusCode)
+                        {
+                            var t = await r.Content.ReadAsStringAsync(); using var d = JsonDocument.Parse(t);
+                            var root = d.RootElement;
+                            if (root.TryGetProperty("latitude", out var laEl) && root.TryGetProperty("longitude", out var loEl))
+                            {
+                                if (laEl.ValueKind != JsonValueKind.Null && loEl.ValueKind != JsonValueKind.Null)
+                                {
+                                    if (double.TryParse(laEl.ToString(), out var la) && double.TryParse(loEl.ToString(), out var lo)) AddCoord(la, lo, "ipapi.co", 1.1);
+                                }
+                            }
+                        }
+                    }
+                    catch { }
+
+                    // geoplugin.net
+                    try
+                    {
+                        using var h = CreateClient(); using var r = await h.GetAsync($"http://www.geoplugin.net/json.gp?ip={ip}");
+                        if (r.IsSuccessStatusCode)
+                        {
+                            var t = await r.Content.ReadAsStringAsync(); using var d = JsonDocument.Parse(t);
+                            var root = d.RootElement;
+                            if (root.TryGetProperty("geoplugin_latitude", out var laEl) && root.TryGetProperty("geoplugin_longitude", out var loEl))
+                            {
+                                if (double.TryParse(laEl.GetString(), out var la) && double.TryParse(loEl.GetString(), out var lo)) AddCoord(la, lo, "geoplugin", 0.8);
+                            }
+                        }
+                    }
+                    catch { }
+
+                    // ipwhois.app
+                    try
+                    {
+                        using var h = CreateClient(); using var r = await h.GetAsync($"https://ipwhois.app/json/{ip}");
+                        if (r.IsSuccessStatusCode)
+                        {
+                            var t = await r.Content.ReadAsStringAsync(); using var d = JsonDocument.Parse(t);
+                            var root = d.RootElement;
+                            if (root.TryGetProperty("latitude", out var laEl) && root.TryGetProperty("longitude", out var loEl))
+                            {
+                                if (double.TryParse(laEl.ToString(), out var la) && double.TryParse(loEl.ToString(), out var lo)) AddCoord(la, lo, "ipwhois.app", 1.0);
+                            }
+                        }
+                    }
+                    catch { }
+
+                    var sources = coords.Select(c => c.src).Distinct().ToList();
+                    if (coords.Count == 0) return (null, null, double.NaN, sources);
+
+                    // compute weighted robust average and an accuracy estimate
+                    double ToRad(double x) => x * Math.PI / 180.0;
+                    double DistKm((double lat, double lon) a, (double lat, double lon) b)
+                    {
+                        var R = 6371.0;
+                        var dLat = ToRad(b.lat - a.lat);
+                        var dLon = ToRad(b.lon - a.lon);
+                        var lat1 = ToRad(a.lat); var lat2 = ToRad(b.lat);
+                        var aa = Math.Pow(Math.Sin(dLat / 2), 2) + Math.Cos(lat1) * Math.Cos(lat2) * Math.Pow(Math.Sin(dLon / 2), 2);
+                        var c = 2 * Math.Atan2(Math.Sqrt(aa), Math.Sqrt(1 - aa));
+                        return R * c;
+                    }
+
+                    var totalW = coords.Sum(c => c.weight);
+                    var weightedLat = coords.Sum(c => c.lat * c.weight) / totalW;
+                    var weightedLon = coords.Sum(c => c.lon * c.weight) / totalW;
+
+                    // compute distances of each point to weighted center
+                    var dists = coords.Select(c => DistKm((c.lat, c.lon), (weightedLat, weightedLon))).ToList();
+                    // remove extreme outliers (beyond 3x median)
+                    var med = dists.OrderBy(x => x).ElementAt(dists.Count / 2);
+                    var filteredIdx = dists.Select((d, i) => new { d, i }).Where(x => x.d <= Math.Max(med * 3.0, 200.0)).Select(x => x.i).ToList();
+                    if (filteredIdx.Count > 0 && filteredIdx.Count < coords.Count)
+                    {
+                        var fw = filteredIdx.Sum(i => coords[i].weight);
+                        weightedLat = filteredIdx.Sum(i => coords[i].lat * coords[i].weight) / fw;
+                        weightedLon = filteredIdx.Sum(i => coords[i].lon * coords[i].weight) / fw;
+                        dists = filteredIdx.Select(i => DistKm((coords[i].lat, coords[i].lon), (weightedLat, weightedLon))).ToList();
+                    }
+
+                    // accuracy estimate: use RMS distance as approx uncertainty
+                    double rms = Math.Sqrt(dists.Average(x => x * x));
+                    // if only one source, be conservative
+                    if (coords.Count == 1) rms = Math.Max(rms, 50.0);
+
+                    return (weightedLat, weightedLon, rms, sources);
+                }
+
+                if (IPAddress.TryParse(ipStr, out var parsed))
+                {
+                    var b = parsed.GetAddressBytes();
+                    if (parsed.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+                    {
+                        if (b[0] == 10 || (b[0] == 172 && b[1] >= 16 && b[1] <= 31) || (b[0] == 192 && b[1] == 168) || b[0] == 127)
+                        {
+                            // Private IP: attempt to determine the public-facing IP of the network and geolocate that instead
+                            try
+                            {
+                                using var httpPub = new HttpClient(); httpPub.Timeout = TimeSpan.FromSeconds(5);
+                                string publicIp = null;
+                                try { publicIp = (await httpPub.GetStringAsync("https://api.ipify.org")).Trim(); } catch { }
+                                if (string.IsNullOrEmpty(publicIp))
+                                {
+                                    try { publicIp = (await httpPub.GetStringAsync("https://icanhazip.com")).Trim(); } catch { }
+                                }
+                                if (string.IsNullOrEmpty(publicIp)) { Console.WriteLine("unknown"); await Task.CompletedTask; return; }
+
+                                var (latp, lonp, accuracyKm, sources) = await GetBestCoordsAsync(publicIp);
+                                string suburb = null;
+                                if (latp == null || lonp == null)
+                                {
+                                    Console.WriteLine("unknown");
+                                    await Task.CompletedTask; return;
+                                }
+
+                                // try reverse geocode to get suburb/locality info using averaged coordinates
+                                try
+                                {
+                                    using var nom = new HttpClient();
+                                    nom.Timeout = TimeSpan.FromSeconds(6);
+                                    nom.DefaultRequestHeaders.UserAgent.ParseAdd("ter/1.0 (contact@local)");
+                                    var nomUrl = $"https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat={latp.Value}&lon={lonp.Value}&addressdetails=1";
+                                    using var nomResp = await nom.GetAsync(nomUrl);
+                                    if (nomResp.IsSuccessStatusCode)
+                                    {
+                                        var nomTxt = await nomResp.Content.ReadAsStringAsync();
+                                        using var nomDoc = JsonDocument.Parse(nomTxt);
+                                        var rootAddr = nomDoc.RootElement;
+                                        suburb = null;
+                                        if (rootAddr.TryGetProperty("address", out var addr))
+                                        {
+                                            if (addr.TryGetProperty("suburb", out var sb)) suburb = sb.GetString();
+                                            else if (addr.TryGetProperty("neighbourhood", out var nb)) suburb = nb.GetString();
+                                            else if (addr.TryGetProperty("residential", out var rs)) suburb = rs.GetString();
+                                        }
+
+                                        // also fetch ip-api style metadata where available
+                                        Console.WriteLine($"Estimated coordinates (sources: {string.Join(',', sources)}): {latp.Value},{lonp.Value} (±{Math.Round(accuracyKm,1)} km)");
+                                        Console.WriteLine($"Suburb: {suburb ?? "(unknown)"}");
+                                    }
+                                    else
+                                    {
+                                        Console.WriteLine($"{latp.Value},{lonp.Value} (±{Math.Round(accuracyKm,1)} km)");
+                                    }
+                                }
+                                catch
+                                {
+                                    Console.WriteLine($"{latp.Value},{lonp.Value} (±{Math.Round(accuracyKm,1)} km)");
+                                }
+                                // Save locate result to file (best-effort)
+                                try
+                                {
+                                    var outDir = Path.Combine(CurrentDirectory, "locate"); Directory.CreateDirectory(outDir);
+                                    var safeIp = (publicIp ?? ipStr).Replace(':', '-').Replace('/', '_');
+                                    var fname = $"locate_{safeIp}_{DateTime.UtcNow:yyyyMMddHHmmss}.json";
+                                    var outFile = Path.Combine(outDir, fname);
+                                    var rec = new Dictionary<string, object?>
+                                    {
+                                        ["query"] = ipStr,
+                                        ["public_ip"] = publicIp,
+                                        ["latitude"] = latp,
+                                        ["longitude"] = lonp,
+                                        ["accuracy_km"] = accuracyKm,
+                                        ["sources"] = sources,
+                                        ["suburb"] = suburb,
+                                        ["timestamp_utc"] = DateTime.UtcNow.ToString("o")
+                                    };
+                                    await File.WriteAllTextAsync(outFile, JsonSerializer.Serialize(rec, new JsonSerializerOptions { WriteIndented = true }));
+                                    Console.WriteLine($"Saved locate result to {outFile}");
+                                }
+                                catch { }
+                            }
+                            catch { Console.WriteLine("unknown"); }
+                            await Task.CompletedTask; return;
+                        }
+                    }
+                }
+
+                using var http = new HttpClient(); http.Timeout = TimeSpan.FromSeconds(8);
+                var url = "http://ip-api.com/json/" + Uri.EscapeDataString(ipStr) + "?fields=status,message,lat,lon,country,regionName,city,zip,timezone,isp,org,query";
+                using var resp = await http.GetAsync(url);
+                var txt = await resp.Content.ReadAsStringAsync();
+                using var doc = JsonDocument.Parse(txt);
+                var root = doc.RootElement;
+                if (root.TryGetProperty("status", out var st) && st.GetString() == "success")
+                {
+                    // Improve accuracy by aggregating multiple geo services
+                    var (maybeLat, maybeLon, maybeAccuracy, maybeSources) = await GetBestCoordsAsync(ipStr);
+                    double lat = maybeLat ?? root.GetProperty("lat").GetDouble();
+                    double lon = maybeLon ?? root.GetProperty("lon").GetDouble();
+                    double accuracyKm = maybeAccuracy;
+
+                    // Attempt reverse geocoding to get suburb/neighbourhood and a more human-friendly place name
+                    string suburb = null;
+                    string displayName = null;
+                    try
+                    {
+                        using var nom = new HttpClient();
+                        nom.Timeout = TimeSpan.FromSeconds(6);
+                        nom.DefaultRequestHeaders.UserAgent.ParseAdd("ter/1.0 (contact@local)");
+                        var nomUrl = $"https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat={lat}&lon={lon}&addressdetails=1";
+                        using var nomResp = await nom.GetAsync(nomUrl);
+                        if (nomResp.IsSuccessStatusCode)
+                        {
+                            var nomTxt = await nomResp.Content.ReadAsStringAsync();
+                            using var nomDoc = JsonDocument.Parse(nomTxt);
+                            var rootAddr = nomDoc.RootElement;
+                            if (rootAddr.TryGetProperty("display_name", out var dn)) displayName = dn.GetString();
+                            if (rootAddr.TryGetProperty("address", out var addr))
+                            {
+                                // Prefer suburb/neighbourhood/residential fields
+                                if (addr.TryGetProperty("suburb", out var sb)) suburb = sb.GetString();
+                                else if (addr.TryGetProperty("neighbourhood", out var nb)) suburb = nb.GetString();
+                                else if (addr.TryGetProperty("residential", out var rs)) suburb = rs.GetString();
+                            }
+                        }
+                    }
+                    catch { }
+
+                    // Try reverse DNS (may reveal hostname/personal device names)
+                    try
+                    {
+                        try { var hostEntry = await Dns.GetHostEntryAsync(ipStr); if (!string.IsNullOrEmpty(hostEntry.HostName)) Console.WriteLine("Reverse DNS: " + hostEntry.HostName); }
+                        catch { }
+
+                        // Try ipinfo.io for additional host/org info (best-effort; rate-limited)
+                        try
+                        {
+                            using var info = new HttpClient(); info.Timeout = TimeSpan.FromSeconds(5);
+                            using var r = await info.GetAsync($"https://ipinfo.io/{ipStr}/json");
+                            if (r.IsSuccessStatusCode)
+                            {
+                                var txtInfo = await r.Content.ReadAsStringAsync(); using var jd = JsonDocument.Parse(txtInfo);
+                                var rootInfo = jd.RootElement;
+                                if (rootInfo.TryGetProperty("org", out var org)) Console.WriteLine("Org: " + org.GetString());
+                                if (rootInfo.TryGetProperty("hostname", out var hn2) && !string.IsNullOrEmpty(hn2.GetString())) Console.WriteLine("Hostname: " + hn2.GetString());
+                                if (rootInfo.TryGetProperty("city", out var city2) || rootInfo.TryGetProperty("region", out var region2))
+                                {
+                                    var cityOut = rootInfo.TryGetProperty("city", out var c) ? c.GetString() : null;
+                                    var regionOut = rootInfo.TryGetProperty("region", out var rgn) ? rgn.GetString() : null;
+                                    Console.WriteLine($"Location: {cityOut ?? ""}{(string.IsNullOrEmpty(cityOut) || string.IsNullOrEmpty(regionOut) ? "" : ", ")}{regionOut ?? ""}");
+                                }
+                            }
+                        }
+                        catch { }
+                    }
+                    catch { }
+
+                    if (!string.IsNullOrEmpty(suburb)) Console.WriteLine($"Suburb: {suburb}");
+                    else if (!string.IsNullOrEmpty(displayName)) Console.WriteLine($"Place: {displayName}");
+                    if (!double.IsNaN(accuracyKm) && accuracyKm > 0) Console.WriteLine($"Estimated accuracy: ±{Math.Round(accuracyKm,1)} km");
+                    Console.WriteLine($"Latitude: {lat}");
+                    Console.WriteLine($"Longitude: {lon}");
+                    // Save locate result to file (best-effort)
+                    try
+                    {
+                        var sourcesList = maybeSources ?? new List<string>();
+                        var outDir = Path.Combine(CurrentDirectory, "locate"); Directory.CreateDirectory(outDir);
+                        var safeIp = ipStr.Replace(':', '-').Replace('/', '_');
+                        var fname = $"locate_{safeIp}_{DateTime.UtcNow:yyyyMMddHHmmss}.txt";
+                        var outFile = Path.Combine(outDir, fname);
+                        var rec = new Dictionary<string, object?>
+                        {
+                            ["query"] = ipStr,
+                            ["latitude"] = lat,
+                            ["longitude"] = lon,
+                            ["accuracy_km"] = accuracyKm,
+                            ["sources"] = sourcesList,
+                            ["place"] = displayName,
+                            ["suburb"] = suburb,
+                            ["timestamp_utc"] = DateTime.UtcNow.ToString("o")
+                        };
+                        await File.WriteAllTextAsync(outFile, JsonSerializer.Serialize(rec, new JsonSerializerOptions { WriteIndented = true }));
+                        Console.WriteLine($"Saved locate result to {outFile}");
+                    }
+                    catch { }
+                }
+                else
+                {
+                    Console.WriteLine("unknown");
+                }
+            }
+            catch { Console.WriteLine("unknown"); }
             await Task.CompletedTask;
         };
 
@@ -769,6 +1967,214 @@ class Program
             await Task.CompletedTask;
         };
 
+        // wifi-list - list available Wi-Fi networks (uses system tools)
+        BuiltInCommands["wifi-list"] = async args =>
+        {
+            try
+            {
+                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                {
+                    var psi = new ProcessStartInfo("netsh", "wlan show networks mode=bssid") { RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true };
+                    using var p = Process.Start(psi);
+                    var outp = await p.StandardOutput.ReadToEndAsync();
+                    await p.WaitForExitAsync();
+                    Console.WriteLine(outp);
+                }
+                else if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+                {
+                    // macOS: try the airport utility
+                    var airport = "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport";
+                    var psi = new ProcessStartInfo(airport, "-s") { RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true };
+                    using var p = Process.Start(psi);
+                    var outp = await p.StandardOutput.ReadToEndAsync();
+                    await p.WaitForExitAsync();
+                    Console.WriteLine(outp);
+                }
+                else
+                {
+                    // assume Linux with NetworkManager
+                    var psi = new ProcessStartInfo("nmcli", "-f SSID,SIGNAL,SECURITY device wifi list") { RedirectStandardOutput = true, UseShellExecute = false, CreateNoWindow = true };
+                    using var p = Process.Start(psi);
+                    var outp = await p.StandardOutput.ReadToEndAsync();
+                    await p.WaitForExitAsync();
+                    Console.WriteLine(outp);
+                }
+            }
+            catch (Exception ex) { Console.WriteLine("wifi-list error: " + ex.Message); }
+            await Task.CompletedTask;
+        };
+
+        // wifi-connect [--force] <ssid> [password] - connect to a Wi-Fi network using provided credentials
+        // --force: try saved profiles and fallback attempts to connect without prompting for password
+        BuiltInCommands["wifi-connect"] = async args =>
+        {
+            if (args.Length < 1) { Console.WriteLine("Usage: wifi-connect [--force] <ssid> [password]"); await Task.CompletedTask; return; }
+            bool force = false; int idx = 0;
+            if (args.Length > 0 && args[0].Equals("--force", StringComparison.OrdinalIgnoreCase)) { force = true; idx = 1; }
+            if (args.Length <= idx) { Console.WriteLine("Usage: wifi-connect [--force] <ssid> [password]"); await Task.CompletedTask; return; }
+            var ssid = args[idx]; var password = args.Length > idx + 1 ? args[idx + 1] : null;
+            try
+            {
+                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                {
+                    if (string.IsNullOrEmpty(password))
+                    {
+                        // attempt to connect to an existing profile
+                        var psi = new ProcessStartInfo("netsh", $"wlan connect name=\"{ssid}\" ssid=\"{ssid}\"") { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
+                        using var p = Process.Start(psi);
+                        if (p != null)
+                        {
+                            var outp = await p.StandardOutput.ReadToEndAsync(); var err = await p.StandardError.ReadToEndAsync(); await p.WaitForExitAsync();
+                            if (!string.IsNullOrWhiteSpace(outp)) Console.WriteLine(outp); if (!string.IsNullOrWhiteSpace(err)) Console.WriteLine(err);
+                            if (p.ExitCode == 0) { Console.WriteLine("Connected (using saved profile)"); await Task.CompletedTask; return; }
+                        }
+                        Console.WriteLine("If connection failed, provide the password: wifi-connect <ssid> <password> or use --force to attempt other fallbacks");
+                    }
+                    else
+                    {
+                        // create a simple WPA2PSK profile XML and add it, then connect
+                        var tmp = Path.Combine(Path.GetTempPath(), Path.GetRandomFileName() + ".xml");
+                        string EscapeXml(string v) => v == null ? string.Empty : v.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;").Replace("\"", "&quot;").Replace("'", "&apos;");
+                        var ssidEsc = EscapeXml(ssid);
+                        var passwordEsc = EscapeXml(password);
+                        var xml = $"<?xml version=\"1.0\"?>\n<WLANProfile xmlns=\"http://www.microsoft.com/networking/WLAN/profile/v1\">\n  <name>{ssidEsc}</name>\n  <SSIDConfig>\n    <SSID>\n      <name>{ssidEsc}</name>\n    </SSID>\n  </SSIDConfig>\n  <connectionType>ESS</connectionType>\n  <connectionMode>auto</connectionMode>\n  <MSM>\n    <security>\n      <authEncryption>\n        <authentication>WPA2PSK</authentication>\n        <encryption>AES</encryption>\n        <useOneX>false</useOneX>\n      </authEncryption>\n      <sharedKey>\n        <keyType>passPhrase</keyType>\n        <protected>false</protected>\n        <keyMaterial>{passwordEsc}</keyMaterial>\n      </sharedKey>\n    </security>\n  </MSM>\n</WLANProfile>";
+                        await File.WriteAllTextAsync(tmp, xml);
+                        try
+                        {
+                            var add = new ProcessStartInfo("netsh", $"wlan add profile filename=\"{tmp}\" user=current") { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
+                            using var p1 = Process.Start(add);
+                            var out1 = await p1.StandardOutput.ReadToEndAsync(); var err1 = await p1.StandardError.ReadToEndAsync(); await p1.WaitForExitAsync(); Console.WriteLine(out1); if (!string.IsNullOrWhiteSpace(err1)) Console.WriteLine(err1);
+
+                            var conn = new ProcessStartInfo("netsh", $"wlan connect name=\"{ssid}\" ssid=\"{ssid}\"") { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
+                            using var p2 = Process.Start(conn);
+                            var out2 = await p2.StandardOutput.ReadToEndAsync(); var err2 = await p2.StandardError.ReadToEndAsync(); await p2.WaitForExitAsync(); Console.WriteLine(out2); if (!string.IsNullOrWhiteSpace(err2)) Console.WriteLine(err2);
+                        }
+                        finally { try { File.Delete(tmp); } catch { } }
+                    }
+                }
+                else if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+                {
+                    // macOS: try networksetup on en0 by default
+                    var dev = "en0";
+                    if (string.IsNullOrEmpty(password))
+                    {
+                        var psi = new ProcessStartInfo("networksetup", $"-setairportnetwork {dev} \"{ssid}\"") { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
+                        using var p = Process.Start(psi);
+                        var outp = await p.StandardOutput.ReadToEndAsync(); var err = await p.StandardError.ReadToEndAsync(); await p.WaitForExitAsync(); Console.WriteLine(outp); if (!string.IsNullOrWhiteSpace(err)) Console.WriteLine(err);
+                    }
+                    else
+                    {
+                        var psi = new ProcessStartInfo("networksetup", $"-setairportnetwork {dev} \"{ssid}\" \"{password}\"") { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
+                        using var p = Process.Start(psi);
+                        var outp = await p.StandardOutput.ReadToEndAsync(); var err = await p.StandardError.ReadToEndAsync(); await p.WaitForExitAsync(); Console.WriteLine(outp); if (!string.IsNullOrWhiteSpace(err)) Console.WriteLine(err);
+                    }
+                }
+                else
+                {
+                    // assume Linux + NetworkManager
+                    try
+                    {
+                        // If no password provided, first try to bring up a saved connection (uses stored creds)
+                        if (string.IsNullOrEmpty(password))
+                        {
+                            try
+                            {
+                                var connUp = new ProcessStartInfo("nmcli", $"connection up \"{ssid}\"") { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
+                                using var pconn = Process.Start(connUp);
+                                if (pconn != null)
+                                {
+                                    var cout = await pconn.StandardOutput.ReadToEndAsync(); var cerr = await pconn.StandardError.ReadToEndAsync(); await pconn.WaitForExitAsync();
+                                    if (!string.IsNullOrWhiteSpace(cout)) Console.WriteLine(cout); if (!string.IsNullOrWhiteSpace(cerr)) Console.WriteLine(cerr);
+                                    if (pconn.ExitCode == 0) { Console.WriteLine("Connected using saved profile."); await Task.CompletedTask; return; }
+                                }
+                            }
+                            catch { }
+
+                            // Next, scan for the SSID and prefer open networks
+                            try
+                            {
+                                var list = new ProcessStartInfo("nmcli", "-t -f SSID,SECURITY device wifi list") { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
+                                using var pls = Process.Start(list);
+                                if (pls != null)
+                                {
+                                    var outt = await pls.StandardOutput.ReadToEndAsync(); await pls.WaitForExitAsync();
+                                    foreach (var line in outt.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries))
+                                    {
+                                        var parts = line.Split(':'); if (parts.Length < 1) continue;
+                                        var s = parts[0]; var sec = parts.Length > 1 ? parts[1] : string.Empty;
+                                        if (s == ssid && (string.IsNullOrEmpty(sec) || sec == "" || sec == "--"))
+                                        {
+                                            // open network found; connect without password
+                                            var psi = new ProcessStartInfo("nmcli", $"device wifi connect \"{ssid}\"") { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
+                                            using var p = Process.Start(psi);
+                                            if (p != null)
+                                            {
+                                                var outp = await p.StandardOutput.ReadToEndAsync(); var err = await p.StandardError.ReadToEndAsync(); await p.WaitForExitAsync();
+                                                if (!string.IsNullOrWhiteSpace(outp)) Console.WriteLine(outp); if (!string.IsNullOrWhiteSpace(err)) Console.WriteLine(err);
+                                                if (p.ExitCode == 0) { Console.WriteLine("Connected to open network."); await Task.CompletedTask; return; }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            catch { }
+                        }
+
+                        // If password provided or fallbacks didn't connect, try the normal connect command (will prompt or fail)
+                        var sbArgs = new StringBuilder();
+                        sbArgs.Append("device wifi connect ");
+                        sbArgs.Append('"').Append(ssid.Replace("\"", "\\\"")).Append('"');
+                        if (!string.IsNullOrEmpty(password))
+                        {
+                            sbArgs.Append(" password ");
+                            sbArgs.Append('"').Append(password.Replace("\"", "\\\"")).Append('"');
+                        }
+                        var psi2 = new ProcessStartInfo("nmcli", sbArgs.ToString()) { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
+                        using var p2 = Process.Start(psi2);
+                        if (p2 != null)
+                        {
+                            var outp2 = await p2.StandardOutput.ReadToEndAsync(); var err2 = await p2.StandardError.ReadToEndAsync(); await p2.WaitForExitAsync();
+                            if (!string.IsNullOrWhiteSpace(outp2)) Console.WriteLine(outp2);
+                            if (!string.IsNullOrWhiteSpace(err2)) Console.WriteLine(err2);
+                            if (p2.ExitCode == 0) { Console.WriteLine("Connected."); await Task.CompletedTask; return; }
+                        }
+
+                        // As a last resort when forced, attempt to create an open connection (will only succeed if network accepts no security)
+                        if (force)
+                        {
+                            try
+                            {
+                                var conName = "temp-" + Guid.NewGuid().ToString("N").Substring(0, 6);
+                                var add = new ProcessStartInfo("nmcli", $"connection add type wifi ifname '*' con-name \"{conName}\" ssid \"{ssid}\"") { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
+                                using var padd = Process.Start(add);
+                                if (padd != null) { var oa = await padd.StandardOutput.ReadToEndAsync(); var ea = await padd.StandardError.ReadToEndAsync(); await padd.WaitForExitAsync(); if (!string.IsNullOrWhiteSpace(oa)) Console.WriteLine(oa); if (!string.IsNullOrWhiteSpace(ea)) Console.WriteLine(ea); }
+
+                                var mod = new ProcessStartInfo("nmcli", $"connection modify \"{conName}\" wifi-sec.key-mgmt none") { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
+                                using var pmod = Process.Start(mod);
+                                if (pmod != null) { var om = await pmod.StandardOutput.ReadToEndAsync(); var em = await pmod.StandardError.ReadToEndAsync(); await pmod.WaitForExitAsync(); if (!string.IsNullOrWhiteSpace(om)) Console.WriteLine(om); if (!string.IsNullOrWhiteSpace(em)) Console.WriteLine(em); }
+
+                                var up = new ProcessStartInfo("nmcli", $"connection up \"{conName}\"") { RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
+                                using var pup = Process.Start(up);
+                                if (pup != null) { var ou = await pup.StandardOutput.ReadToEndAsync(); var eu = await pup.StandardError.ReadToEndAsync(); await pup.WaitForExitAsync(); if (!string.IsNullOrWhiteSpace(ou)) Console.WriteLine(ou); if (!string.IsNullOrWhiteSpace(eu)) Console.WriteLine(eu); if (pup.ExitCode == 0) { Console.WriteLine("Connected (temporary open profile)"); await Task.CompletedTask; return; } }
+                            }
+                            catch { }
+                        }
+
+                        Console.WriteLine("Failed to connect. Ensure credentials are correct or run with --force to try saved profiles/open-network fallbacks.");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine("nmcli error: " + ex.Message);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("wifi-connect error: " + ex.Message);
+            }
+            await Task.CompletedTask;
+        };
+
         // dns <host> - resolve host to IPs
         BuiltInCommands["dns"] = async args =>
         {
@@ -869,7 +2275,134 @@ class Program
                 string targetArg = argList.Count > 0 ? argList[0] : "local";
                 string portsArg = argList.Count > 1 ? argList[1] : "22,80,443,3389,3306,8080,53,21,25,445";
 
-                var doSubnetScan = new[] { "local", "in", "lan", "network", "subnet", "" };
+                var doSubnetScan = new[] { "local", "in", "lan", "network", "subnet", "", "all", "allnets", "networks" };
+                var allNetsKeys = new[] { "all", "allnets", "networks" };
+
+                // If user asked to scan all local networks, enumerate all interfaces and perform a limited sweep per network.
+                if (allNetsKeys.Contains(targetArg.ToLowerInvariant()))
+                {
+                    Console.WriteLine("WARNING: This will scan all local networks discovered on this machine. Ensure you have authorization.");
+                    Console.Write("Proceed? (y/N): ");
+                    var ok = Console.ReadLine(); if (string.IsNullOrEmpty(ok) || !ok.Trim().StartsWith("y", StringComparison.OrdinalIgnoreCase)) { Console.WriteLine("Aborted."); await Task.CompletedTask; return; }
+
+                    int perSubnetMax = 128; // default limit per subnet
+                    if (argList.Count > 1 && int.TryParse(argList[1], out var pm)) perSubnetMax = Math.Min(1024, Math.Max(4, pm));
+
+                    // ports to scan (from args or default)
+                    var portsArgAll = argList.Count > 2 ? argList[2] : "22,80,443,3389,3306,8080,53,21,25,445";
+                    var portsAll = new List<int>();
+                    foreach (var token in portsArgAll.Split(',', StringSplitOptions.RemoveEmptyEntries))
+                    {
+                        var t = token.Trim();
+                        if (t.Contains('-'))
+                        {
+                            var p = t.Split('-', 2);
+                            if (int.TryParse(p[0], out var a) && int.TryParse(p[1], out var b)) { for (int j = Math.Min(a,b); j <= Math.Max(a,b); j++) portsAll.Add(j); }
+                        }
+                        else if (int.TryParse(t, out var p)) portsAll.Add(p);
+                    }
+                    portsAll = portsAll.Distinct().Where(p => p >= 1 && p <= 65535).OrderBy(p => p).ToList();
+                    if (portsAll.Count == 0) { Console.WriteLine("No ports to scan."); await Task.CompletedTask; return; }
+
+                    var interfaces = NetworkInterface.GetAllNetworkInterfaces().Where(ni => ni.OperationalStatus == OperationalStatus.Up);
+                    var subnets = new List<string>();
+                    foreach (var ni in interfaces)
+                    {
+                        try
+                        {
+                            foreach (var ua in ni.GetIPProperties().UnicastAddresses)
+                            {
+                                if (ua.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork && !IPAddress.IsLoopback(ua.Address))
+                                {
+                                    var parts = ua.Address.ToString().Split('.');
+                                    if (parts.Length == 4)
+                                    {
+                                        var prefix = string.Join('.', parts.Take(3)) + ".";
+                                        if (!subnets.Contains(prefix)) subnets.Add(prefix);
+                                    }
+                                }
+                            }
+                        }
+                        catch { }
+                    }
+
+                    if (subnets.Count == 0) { Console.WriteLine("No IPv4 subnets found."); await Task.CompletedTask; return; }
+                    Console.WriteLine($"Discovered subnets: {string.Join(',', subnets)}");
+
+                    var globalUp = new List<string>();
+                    var pingSem = new System.Threading.SemaphoreSlim(200);
+                    var pingTasks = new List<Task>();
+                    foreach (var prefix in subnets)
+                    {
+                        int max = perSubnetMax;
+                        for (int i = 1; i <= max; i++)
+                        {
+                            var ip = prefix + i;
+                            await pingSem.WaitAsync();
+                            pingTasks.Add(Task.Run(async () =>
+                            {
+                                try { using var p = new Ping(); var r = await p.SendPingAsync(ip, 300); if (r.Status == IPStatus.Success) lock (globalUp) { globalUp.Add(ip); } }
+                                catch { }
+                                finally { pingSem.Release(); }
+                            }));
+                        }
+                    }
+                    await Task.WhenAll(pingTasks);
+                    // augment hosts with entries in the ARP/neighbor table to catch devices that drop ICMP
+                    try
+                    {
+                        var arp = await GetArpTableAsync();
+                        foreach (var ip in arp.Keys)
+                        {
+                            if (!globalUp.Contains(ip)) globalUp.Add(ip);
+                        }
+                    }
+                    catch { }
+                    globalUp = globalUp.OrderBy(x => x).ToList();
+                    Console.WriteLine($"Hosts up across networks: {string.Join(',', globalUp)}");
+
+                    if (globalUp.Count == 0) { Console.WriteLine("No hosts found up on local networks."); await Task.CompletedTask; return; }
+
+                    var hostSem = new System.Threading.SemaphoreSlim(30);
+                    var hostTasks = new List<Task>();
+                    var wellKnown = new Dictionary<int,string> { [22] = "ssh", [80] = "http", [443] = "https", [3389] = "rdp", [3306] = "mysql", [8080] = "http-alt", [53] = "dns", [21] = "ftp", [25] = "smtp", [445] = "microsoft-ds" };
+                    var arpMap = new Dictionary<string,string>();
+                    try { arpMap = await GetArpTableAsync(); } catch { }
+
+                    foreach (var h in globalUp)
+                    {
+                        await hostSem.WaitAsync();
+                        hostTasks.Add(Task.Run(async () =>
+                        {
+                            try
+                            {
+                                // attempt to resolve a friendly device name (reverse DNS, NetBIOS/mDNS fallbacks)
+                                string devNameAll = null;
+                                try { var heAll = await Dns.GetHostEntryAsync(h); if (!string.IsNullOrEmpty(heAll?.HostName)) devNameAll = heAll.HostName; } catch { }
+                                try { if (string.IsNullOrEmpty(devNameAll)) devNameAll = await ResolveFriendlyNameAsync(h); } catch { }
+                                arpMap.TryGetValue(h, out var macAll);
+                                Console.WriteLine($"\nHost: {h}{(string.IsNullOrEmpty(devNameAll) ? "" : " (" + devNameAll + ")")}{(string.IsNullOrEmpty(macAll) ? "" : " MAC: " + macAll)} ");
+                                foreach (var port in portsAll)
+                                {
+                                    try
+                                    {
+                                        using var tc = new TcpClient();
+                                        var conn = tc.ConnectAsync(h, port);
+                                        var comp = await Task.WhenAny(conn, Task.Delay(500));
+                                        if (comp == conn && tc.Connected)
+                                        {
+                                            Console.Write($"  {port}: open"); if (wellKnown.TryGetValue(port, out var svc)) Console.Write($" ({svc})"); Console.WriteLine();
+                                        }
+                                    }
+                                    catch { }
+                                }
+                            }
+                            finally { hostSem.Release(); }
+                        }));
+                    }
+                    await Task.WhenAll(hostTasks);
+                    await Task.CompletedTask; return;
+                }
                 if (doSubnetScan.Contains(targetArg.ToLowerInvariant()))
                 {
                     // find local IPv4 and IPv6 addresses
@@ -890,29 +2423,32 @@ class Program
 
                     if (localV4 != null)
                     {
-                        var parts = localV4.Split('.'); var prefix = string.Join('.', parts.Take(3)) + ".";
-                        int max = 64; // limit sweep size
-                        if (argList.Count > 1 && int.TryParse(argList[1], out var m)) max = Math.Min(254, Math.Max(4, m));
-                        Console.WriteLine($"Scanning local IPv4 subnet {prefix}1-{prefix}{max} (ping sweep + port scan)...");
-
-                        // ping sweep (IPv4)
-                        var up = new List<string>();
-                        var pingSem = new System.Threading.SemaphoreSlim(100);
-                        var pingTasks = new List<Task>();
-                        for (int i = 1; i <= max; i++)
+                        // Determine all connected IPv4 subnets from active interfaces
+                        var prefixes = new List<string>();
+                        foreach (var ni in NetworkInterface.GetAllNetworkInterfaces().Where(n => n.OperationalStatus == OperationalStatus.Up))
                         {
-                            var ip = prefix + i;
-                            await pingSem.WaitAsync();
-                            pingTasks.Add(Task.Run(async () =>
+                            try
                             {
-                                try { using var p = new Ping(); var r = await p.SendPingAsync(ip, 300); if (r.Status == IPStatus.Success) lock (up) { up.Add(ip); } }
-                                catch { }
-                                finally { pingSem.Release(); }
-                            }));
+                                foreach (var ua in ni.GetIPProperties().UnicastAddresses)
+                                {
+                                    if (ua.Address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork && !IPAddress.IsLoopback(ua.Address))
+                                    {
+                                        var parts = ua.Address.ToString().Split('.');
+                                        if (parts.Length == 4)
+                                        {
+                                            var prefix = string.Join('.', parts.Take(3)) + ".";
+                                            if (!prefixes.Contains(prefix)) prefixes.Add(prefix);
+                                        }
+                                    }
+                                }
+                            }
+                            catch { }
                         }
-                        await Task.WhenAll(pingTasks);
-                        up = up.OrderBy(x => x).ToList();
-                        Console.WriteLine($"IPv4 hosts up: {string.Join(',', up)}");
+                        if (prefixes.Count == 0) { Console.WriteLine("No IPv4 subnets found."); await Task.CompletedTask; return; }
+
+                        int perSubnetMax = 64; // default per-subnet sweep
+                        if (argList.Count > 1 && int.TryParse(argList[1], out var m)) perSubnetMax = Math.Min(254, Math.Max(4, m));
+                        Console.WriteLine($"Scanning connected IPv4 subnets: {string.Join(',', prefixes)} (ping sweep + port scan, up to {perSubnetMax} hosts per subnet)...");
 
                         // parse portsArg
                         var ports = new List<int>();
@@ -931,17 +2467,56 @@ class Program
 
                         var wellKnown = new Dictionary<int,string> { [22] = "ssh", [80] = "http", [443] = "https", [3389] = "rdp", [3306] = "mysql", [8080] = "http-alt", [53] = "dns", [21] = "ftp", [25] = "smtp", [445] = "microsoft-ds" };
 
-                        // scan each up host, limited parallelism
+                        var globalUp = new List<string>();
+                        var pingSem = new System.Threading.SemaphoreSlim(200);
+                        var pingTasks = new List<Task>();
+                        foreach (var prefix in prefixes)
+                        {
+                            int max = perSubnetMax;
+                            for (int i = 1; i <= max; i++)
+                            {
+                                var ip = prefix + i;
+                                await pingSem.WaitAsync();
+                                pingTasks.Add(Task.Run(async () =>
+                                {
+                                    try { using var p = new Ping(); var r = await p.SendPingAsync(ip, 300); if (r.Status == IPStatus.Success) lock (globalUp) { globalUp.Add(ip); } }
+                                    catch { }
+                                    finally { pingSem.Release(); }
+                                }));
+                            }
+                        }
+                        await Task.WhenAll(pingTasks);
+                    // augment hosts with ARP/neighbour entries to improve accuracy for hosts that block ICMP
+                    try
+                    {
+                        var arp = await GetArpTableAsync();
+                        foreach (var ip in arp.Keys)
+                        {
+                            if (!globalUp.Contains(ip)) globalUp.Add(ip);
+                        }
+                    }
+                    catch { }
+                    globalUp = globalUp.OrderBy(x => x).ToList();
+                        Console.WriteLine($"IPv4 hosts up: {string.Join(',', globalUp)}");
+
+                        if (globalUp.Count == 0) { Console.WriteLine("No hosts found up on local networks."); await Task.CompletedTask; return; }
+
+                        // scan each up host, limited parallelism, and attempt to resolve device name
                         var hostSem = new System.Threading.SemaphoreSlim(10);
                         var hostTasks = new List<Task>();
-                        foreach (var h in up)
+                        foreach (var h in globalUp)
                         {
                             await hostSem.WaitAsync();
                             hostTasks.Add(Task.Run(async () =>
                             {
                                 try
                                 {
-                                    Console.WriteLine($"\nHost: {h}");
+                                    string devName = null;
+                                    try { var he = await Dns.GetHostEntryAsync(h); if (!string.IsNullOrEmpty(he?.HostName)) devName = he.HostName; } catch { }
+                                    try { if (string.IsNullOrEmpty(devName)) devName = await ResolveFriendlyNameAsync(h); } catch { }
+                                    var arpMapLocal = new Dictionary<string,string>(); try { arpMapLocal = await GetArpTableAsync(); } catch { }
+                                    arpMapLocal.TryGetValue(h, out var mac);
+                                    Console.WriteLine($"\nHost: {h}{(string.IsNullOrEmpty(devName) ? "" : " (" + devName + ")")}{(string.IsNullOrEmpty(mac) ? "" : " MAC: " + mac)} ");
                                     foreach (var port in ports)
                                     {
                                         try
@@ -952,9 +2527,36 @@ class Program
                                             if (comp == conn && tc.Connected)
                                             {
                                                 Console.Write($"  {port}: open"); if (wellKnown.TryGetValue(port, out var svc)) Console.Write($" ({svc})"); Console.WriteLine();
+                                                try
+                                                {
+                                                    using var ns = tc.GetStream();
+                                                    ns.ReadTimeout = 500; ns.WriteTimeout = 500;
+                                                    if (port == 80 || port == 8080 || port == 8000)
+                                                    {
+                                                        var probe = Encoding.ASCII.GetBytes("HEAD / HTTP/1.0\r\nHost: " + h + "\r\n\r\n");
+                                                        await ns.WriteAsync(probe, 0, probe.Length);
+                                                        var buf = new byte[512];
+                                                        var readTask = ns.ReadAsync(buf, 0, buf.Length);
+                                                        var rcomp = await Task.WhenAny(readTask, Task.Delay(500));
+                                                        if (rcomp == readTask && readTask.Result > 0)
+                                                        {
+                                                            var txt = Encoding.UTF8.GetString(buf, 0, readTask.Result);
+                                                            var firstLine = txt.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "";
+                                                            Console.WriteLine("  banner: " + (firstLine.Length>200? firstLine.Substring(0,200)+"...": firstLine));
+                                                        }
+                                                    }
+                                                }
+                                                catch { }
+                                            }
+                                            else
+                                            {
+                                                Console.WriteLine($"{h} {port}: closed");
                                             }
                                         }
-                                        catch { }
+                                        catch (Exception ex)
+                                        {
+                                            Console.WriteLine($"{h} {port}: error ({ex.Message})");
+                                        }
                                     }
                                 }
                                 finally { hostSem.Release(); }
@@ -1041,7 +2643,10 @@ class Program
                             if (consent == null || !consent.Trim().Equals("I have permission", StringComparison.Ordinal)) { Console.WriteLine("Skipped external address: " + addr); continue; }
                         }
 
-                        Console.WriteLine($"Scanning address {addr} ({addr.AddressFamily})...");
+                        // attempt reverse DNS for this address to show a friendly device name when available
+                        string singleDevName = null;
+                        try { var heSingle = await Dns.GetHostEntryAsync(addr); if (!string.IsNullOrEmpty(heSingle?.HostName)) singleDevName = heSingle.HostName; } catch { }
+                        Console.WriteLine($"Scanning address {addr} ({addr.AddressFamily}){(string.IsNullOrEmpty(singleDevName) ? "" : " (" + singleDevName + ")")}...");
                         foreach (var port in portsSingle)
                         {
                             try
@@ -1516,8 +3121,49 @@ class Program
 
         BuiltInCommands["search"] = async args =>
         {
-            if (args.Length == 0) { Console.WriteLine("Usage: search <pattern>"); await Task.CompletedTask; return; }
-            try { foreach (var f in Directory.EnumerateFiles(CurrentDirectory, "*" + args[0] + "*", SearchOption.AllDirectories)) Console.WriteLine(f); }
+            if (args.Length == 0) { Console.WriteLine("Usage: search <pattern> [location]"); await Task.CompletedTask; return; }
+            var pattern = args[0];
+            string location = args.Length > 1 ? args[1] : null;
+            try
+            {
+                var roots = new List<string>();
+                if (!string.IsNullOrEmpty(location))
+                {
+                    // allow keywords: desktop, downloads, documents, home, all
+                    var loc = location.ToLowerInvariant();
+                    var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                    if (loc == "desktop") roots.Add(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory));
+                    else if (loc == "downloads") roots.Add(Path.Combine(userProfile, "Downloads"));
+                    else if (loc == "documents") roots.Add(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments));
+                    else if (loc == "home" || loc == "profile") roots.Add(userProfile);
+                    else if (loc == "all") roots.AddRange(GetDefaultSearchRoots());
+                    else roots.Add(Path.GetFullPath(Path.Combine(CurrentDirectory, location)));
+                }
+                else
+                {
+                    roots.Add(CurrentDirectory);
+                }
+
+                // If single root is current and user wants broad search, include defaults
+                if (roots.Count == 1 && roots[0] == CurrentDirectory)
+                {
+                    roots.AddRange(GetDefaultSearchRoots().Where(r => r != null && r != CurrentDirectory));
+                }
+
+                var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var root in roots)
+                {
+                    if (string.IsNullOrEmpty(root) || !Directory.Exists(root)) continue;
+                    try
+                    {
+                        foreach (var f in Directory.EnumerateFiles(root, "*" + pattern + "*", SearchOption.AllDirectories))
+                        {
+                            if (seen.Add(f)) Console.WriteLine(f);
+                        }
+                    }
+                    catch { }
+                }
+            }
             catch (Exception ex) { Console.WriteLine("search error: " + ex.Message); }
             await Task.CompletedTask;
         };
@@ -1543,25 +3189,130 @@ class Program
         BuiltInCommands["showdownloads"] = async args => { var dl = Path.Combine(CurrentDirectory, "downloads"); if (Directory.Exists(dl)) foreach (var d in Directory.GetFileSystemEntries(dl)) Console.WriteLine(d); else Console.WriteLine("no downloads"); await Task.CompletedTask; };
         BuiltInCommands["showinstalled"] = async args => { var ins = Path.Combine(CurrentDirectory, "installed"); if (Directory.Exists(ins)) foreach (var d in Directory.GetFileSystemEntries(ins)) Console.WriteLine(d); else Console.WriteLine("no installed"); await Task.CompletedTask; };
 
-        // Additional safe "legal hacks" utilities
+        // b64 - improved encoder/decoder. Supports AES-GCM encryption with passphrase and optional gzip compression.
+        // Usage:
+        //   b64 encode [--password <pw>] [--compress] <text>
+        //   b64 decode [--password <pw>] <base64>
         BuiltInCommands["b64"] = async args =>
         {
-            if (args.Length < 2) { Console.WriteLine("Usage: b64 <encode|decode> <text>"); await Task.CompletedTask; return; }
+            if (args.Length < 2) { Console.WriteLine("Usage: b64 encode|decode [--password <pw>] [--compress] <text>"); await Task.CompletedTask; return; }
             try
             {
-                var mode = args[0].ToLowerInvariant();
-                var text = string.Join(' ', args.Skip(1));
+                var list = args.ToList();
+                var mode = list[0].ToLowerInvariant();
+                string password = null; bool compress = false;
+                // parse flags
+                for (int i = 1; i < list.Count; i++)
+                {
+                    if (list[i] == "--password" && i + 1 < list.Count) { password = list[i + 1]; list[i] = null; list[i + 1] = null; i++; }
+                    else if (list[i] == "--compress") { compress = true; list[i] = null; }
+                }
+                var remaining = list.Where(s => !string.IsNullOrEmpty(s)).Skip(1).ToArray();
+                if (remaining.Length == 0) { Console.WriteLine("Missing text argument"); await Task.CompletedTask; return; }
+                var text = string.Join(' ', remaining);
+
+                byte[] CompressIfNeeded(byte[] input)
+                {
+                    if (!compress) return input;
+                    using var ms = new MemoryStream(); using (var gz = new GZipStream(ms, CompressionLevel.Optimal, true)) { gz.Write(input, 0, input.Length); }
+                    return ms.ToArray();
+                }
+
+                byte[] DecompressIfNeeded(byte[] input)
+                {
+                    try
+                    {
+                        using var inMs = new MemoryStream(input);
+                        using var gz = new GZipStream(inMs, CompressionMode.Decompress);
+                        using var outMs = new MemoryStream(); gz.CopyTo(outMs); return outMs.ToArray();
+                    }
+                    catch { return input; }
+                }
+
                 if (mode == "encode")
                 {
-                    var bytes = Encoding.UTF8.GetBytes(text);
-                    Console.WriteLine(Convert.ToBase64String(bytes));
+                    var plain = Encoding.UTF8.GetBytes(text);
+                    var toEncrypt = CompressIfNeeded(plain);
+                    if (string.IsNullOrEmpty(password))
+                    {
+                        // no password: produce a safe plain marker + base64
+                        var header = Encoding.ASCII.GetBytes("PLN");
+                        var outb = new byte[header.Length + toEncrypt.Length]; Buffer.BlockCopy(header, 0, outb, 0, header.Length); Buffer.BlockCopy(toEncrypt, 0, outb, header.Length, toEncrypt.Length);
+                        Console.WriteLine(Convert.ToBase64String(outb));
+                        await Task.CompletedTask; return;
+                    }
+
+                    // derive key with PBKDF2 using random salt
+                    var salt = new byte[16]; RandomNumberGenerator.Fill(salt);
+                    using var kdf = new Rfc2898DeriveBytes(password, salt, 200_000, HashAlgorithmName.SHA256);
+                    var key = kdf.GetBytes(32);
+                    var nonce = new byte[12]; RandomNumberGenerator.Fill(nonce);
+                    var cipher = new byte[toEncrypt.Length]; var tag = new byte[16];
+                    try
+                    {
+                        using var aesg = new AesGcm(key);
+                        aesg.Encrypt(nonce, toEncrypt, cipher, tag);
+                    }
+                    finally { Array.Clear(key); }
+
+                    // blob = header("AG1") + salt(16) + nonce(12) + tag(16) + cipher
+                    using var outStream = new MemoryStream();
+                    outStream.Write(Encoding.ASCII.GetBytes("AG1"), 0, 3);
+                    outStream.Write(salt, 0, salt.Length);
+                    outStream.Write(nonce, 0, nonce.Length);
+                    outStream.Write(tag, 0, tag.Length);
+                    outStream.Write(cipher, 0, cipher.Length);
+                    Console.WriteLine(Convert.ToBase64String(outStream.ToArray()));
+                    await Task.CompletedTask; return;
                 }
                 else if (mode == "decode")
                 {
-                    try { var bytes = Convert.FromBase64String(text); Console.WriteLine(Encoding.UTF8.GetString(bytes)); }
-                    catch { Console.WriteLine("Invalid base64 string"); }
+                    byte[] blob;
+                    try { blob = Convert.FromBase64String(text); }
+                    catch { Console.WriteLine("Invalid base64 input"); await Task.CompletedTask; return; }
+                    if (blob.Length < 3) { Console.WriteLine("Invalid input"); await Task.CompletedTask; return; }
+                    var hdr = Encoding.ASCII.GetString(blob, 0, 3);
+                    if (hdr == "PLN")
+                    {
+                        var data = new byte[blob.Length - 3]; Buffer.BlockCopy(blob, 3, data, 0, data.Length);
+                        var dec = DecompressIfNeeded(data);
+                        Console.WriteLine(Encoding.UTF8.GetString(dec)); await Task.CompletedTask; return;
+                    }
+                    else if (hdr == "AG1")
+                    {
+                        // parse salt, nonce, tag
+                        if (blob.Length < 3 + 16 + 12 + 16) { Console.WriteLine("Invalid encrypted blob"); await Task.CompletedTask; return; }
+                        var pos = 3;
+                        var salt = new byte[16]; Buffer.BlockCopy(blob, pos, salt, 0, 16); pos += 16;
+                        var nonce = new byte[12]; Buffer.BlockCopy(blob, pos, nonce, 0, 12); pos += 12;
+                        var tag = new byte[16]; Buffer.BlockCopy(blob, pos, tag, 0, 16); pos += 16;
+                        var cipher = new byte[blob.Length - pos]; Buffer.BlockCopy(blob, pos, cipher, 0, cipher.Length);
+
+                        if (string.IsNullOrEmpty(password))
+                        {
+                            Console.Write("Password: "); password = Console.ReadLine();
+                        }
+
+                        using var kdf = new Rfc2898DeriveBytes(password, salt, 200_000, HashAlgorithmName.SHA256);
+                        var key = kdf.GetBytes(32);
+                        var plain = new byte[cipher.Length];
+                        try
+                        {
+                            using var aesg = new AesGcm(key);
+                            aesg.Decrypt(nonce, cipher, tag, plain);
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine("Decryption failed: " + ex.Message); await Task.CompletedTask; return;
+                        }
+                        finally { Array.Clear(key); }
+
+                        var dec = DecompressIfNeeded(plain);
+                        Console.WriteLine(Encoding.UTF8.GetString(dec)); await Task.CompletedTask; return;
+                    }
+                    else { Console.WriteLine("Unknown input format"); await Task.CompletedTask; return; }
                 }
-                else Console.WriteLine("Usage: b64 <encode|decode> <text>");
+                else Console.WriteLine("Usage: b64 encode|decode [--password <pw>] [--compress] <text>");
             }
             catch (Exception ex) { Console.WriteLine("b64 error: " + ex.Message); }
             await Task.CompletedTask;
@@ -1991,6 +3742,60 @@ class Program
         catch { return null; }
     }
 
+    // Read the OS ARP/neighbor table and return a map of ip -> mac (best-effort).
+    static async Task<Dictionary<string,string>> GetArpTableAsync()
+    {
+        var map = new Dictionary<string,string>();
+        try
+        {
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            {
+                // arp -a output
+                var outp = await RunProcessCaptureOutputAsync("arp", "-a", 1500) ?? string.Empty;
+                var lines = outp.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                var rx = new Regex(@"(?<ip>\d+\.\d+\.\d+\.\d+)\s+((?<mac>[0-9A-Fa-f\-:]{17})|(?<mac2>[0-9A-Fa-f]{2}-[0-9A-Fa-f]{2}-[0-9A-Fa-f]{2}-[0-9A-Fa-f]{2}-[0-9A-Fa-f]{2}-[0-9A-Fa-f]{2}))");
+                foreach (var l in lines)
+                {
+                    var m = rx.Match(l);
+                    if (m.Success)
+                    {
+                        var ip = m.Groups["ip"].Value.Trim();
+                        var mac = (m.Groups["mac"].Success ? m.Groups["mac"].Value : (m.Groups["mac2"].Success ? m.Groups["mac2"].Value : null));
+                        if (!string.IsNullOrEmpty(ip) && !string.IsNullOrEmpty(mac)) map[ip] = mac.Replace('-', ':').ToLowerInvariant();
+                    }
+                }
+            }
+            else
+            {
+                // try ip neigh (Linux) or arp -n fallback
+                var outp = await RunProcessCaptureOutputAsync("ip", "neigh", 1500);
+                if (!string.IsNullOrEmpty(outp))
+                {
+                    var lines = outp.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                    var rx = new Regex(@"(?<ip>\d+\.\d+\.\d+\.\d+).*lladdr\s+(?<mac>[0-9A-Fa-f:]{17})");
+                    foreach (var l in lines)
+                    {
+                        var m = rx.Match(l);
+                        if (m.Success) map[m.Groups["ip"].Value.Trim()] = m.Groups["mac"].Value.ToLowerInvariant();
+                    }
+                }
+                if (map.Count == 0)
+                {
+                    var outp2 = await RunProcessCaptureOutputAsync("arp", "-n", 1200) ?? string.Empty;
+                    var lines2 = outp2.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                    var rx2 = new Regex(@"(?<ip>\d+\.\d+\.\d+\.\d+)\s+.*?(?<mac>[0-9A-Fa-f:]{17})");
+                    foreach (var l in lines2)
+                    {
+                        var m = rx2.Match(l);
+                        if (m.Success) map[m.Groups["ip"].Value.Trim()] = m.Groups["mac"].Value.ToLowerInvariant();
+                    }
+                }
+            }
+        }
+        catch { }
+        return map;
+    }
+
     static async Task DownloadFileFromGitHubAsync(string repoSpecifier, string pathInRepo, bool retryUntilSuccess = false, bool force = false)
     {
         string ownerRepo = repoSpecifier; if (repoSpecifier.StartsWith("http://") || repoSpecifier.StartsWith("https://")) { try { var uri = new Uri(repoSpecifier); var parts = uri.AbsolutePath.Trim('/').Split('/'); if (parts.Length >= 2) ownerRepo = parts[0] + "/" + parts[1]; } catch { } }
@@ -2045,6 +3850,206 @@ class Program
         foreach (var dir in Directory.GetDirectories(sourceDir)) CopyDirectory(dir, Path.Combine(destDir, Path.GetFileName(dir)));
     }
 
+    // Attempt to run a process and capture stdout/stderr (best-effort). Returns null on failure or timeout.
+    static async Task<string> RunProcessCaptureOutputAsync(string fileName, string arguments, int timeoutMs = 2000)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo(fileName, arguments)
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            using var p = Process.Start(psi);
+            if (p == null) return null;
+            var outTask = p.StandardOutput.ReadToEndAsync();
+            var errTask = p.StandardError.ReadToEndAsync();
+            var all = Task.WhenAll(outTask, errTask);
+            var completed = await Task.WhenAny(all, Task.Delay(timeoutMs));
+            if (completed != all)
+            {
+                try { p.Kill(); } catch { }
+                return null;
+            }
+
+    // Load user-defined commands from the ./cmdsforter directory and register them
+    static void LoadUserCommands()
+    {
+        try
+        {
+            var root = Path.Combine(CurrentDirectory, "cmdsforter");
+            if (!Directory.Exists(root)) return;
+            foreach (var d in Directory.GetDirectories(root))
+            {
+                var name = Path.GetFileName(d);
+                if (string.IsNullOrWhiteSpace(name)) continue;
+                RegisterUserCommand(name, d);
+            }
+        }
+        catch { }
+    }
+
+    static void RegisterUserCommand(string name, string folderPath)
+    {
+        // replace or add
+        BuiltInCommands[name] = async args =>
+        {
+            try
+            {
+                if (!Directory.Exists(folderPath)) { Console.WriteLine("Command folder missing: " + folderPath); await Task.CompletedTask; return; }
+                var script = FindRunScriptInFolder(folderPath);
+                if (script == null) { Console.WriteLine("No runnable script found in command folder: " + folderPath); await Task.CompletedTask; return; }
+
+                string JoinArgs(string[] a)
+                {
+                    if (a == null || a.Length == 0) return string.Empty;
+                    return string.Join(' ', a.Select(s => QuoteArg(s)));
+                }
+
+                var argstr = JoinArgs(args);
+                var isWin = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+                string cmd;
+                var ext = Path.GetExtension(script).ToLowerInvariant();
+                if (isWin)
+                {
+                    if (ext == ".ps1") cmd = $"powershell -NoProfile -ExecutionPolicy Bypass -File {QuoteArg(script)} {argstr}";
+                    else cmd = QuoteArg(script) + (string.IsNullOrEmpty(argstr) ? string.Empty : " " + argstr);
+                }
+                else
+                {
+                    // rely on shebang or shell to run; ensure path is quoted
+                    cmd = QuoteArg(script) + (string.IsNullOrEmpty(argstr) ? string.Empty : " " + argstr);
+                }
+
+                await RunExternalAsync(cmd);
+            }
+            catch (Exception ex) { Console.WriteLine($"{name} error: " + ex.Message); }
+            await Task.CompletedTask;
+        };
+    }
+
+    static string FindRunScriptInFolder(string folder)
+    {
+        // Preferred names first
+        var candidates = new[] { "run", "run.sh", "run.bat", "run.cmd", "run.ps1", "run.exe" };
+        foreach (var c in candidates)
+        {
+            var p = Path.Combine(folder, c);
+            if (File.Exists(p)) return p;
+        }
+        // fall back to any executable-ish file
+        var exts = new[] { ".sh", ".py", ".ps1", ".exe", ".bat", ".cmd" };
+        foreach (var f in Directory.GetFiles(folder))
+        {
+            var e = Path.GetExtension(f).ToLowerInvariant();
+            if (exts.Contains(e)) return f;
+        }
+        // last resort: any file (maybe script without ext)
+        var any = Directory.GetFiles(folder).FirstOrDefault();
+        return any;
+    }
+
+    static string QuoteArg(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return "\"\"";
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            if (s.Contains(' ')) return "\"" + s + "\"";
+            return s;
+        }
+        // for unix shells, single-quote and escape single quotes inside
+        if (!s.Contains('\'')) return "'" + s + "'";
+        return '"' + s.Replace("\"", "\\\"") + '"';
+    }
+            await all;
+            return (outTask.Result ?? "") + "\n" + (errTask.Result ?? "");
+        }
+        catch { return null; }
+    }
+
+    // Try multiple fallbacks to resolve a friendly machine name for an IP: reverse DNS, NetBIOS (nbtstat/nmblookup), mDNS (avahi-resolve), host/dig.
+    static async Task<string> ResolveFriendlyNameAsync(string ip)
+    {
+        try
+        {
+            // reverse DNS
+            try
+            {
+                var he = await Dns.GetHostEntryAsync(ip);
+                if (!string.IsNullOrEmpty(he?.HostName)) return he.HostName;
+            }
+            catch { }
+
+            // NetBIOS via external tools
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            {
+                var outp = await RunProcessCaptureOutputAsync("nbtstat", "-A " + ip, 2000);
+                if (!string.IsNullOrEmpty(outp))
+                {
+                    foreach (var line in outp.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+                    {
+                        var l = line.Trim();
+                        if (l.Contains("<00>") || l.Contains("<20>"))
+                        {
+                            var idx = l.IndexOf('<');
+                            if (idx > 0)
+                            {
+                                var name = l.Substring(0, idx).Trim();
+                                if (!string.IsNullOrEmpty(name) && !name.Equals("WORKGROUP", StringComparison.OrdinalIgnoreCase)) return name;
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
+                var outp = await RunProcessCaptureOutputAsync("nmblookup", $"-A {ip}", 2000);
+                if (!string.IsNullOrEmpty(outp))
+                {
+                    foreach (var line in outp.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+                    {
+                        var l = line.Trim();
+                        if (l.Contains("<00>") || l.Contains("<20>"))
+                        {
+                            var idx = l.IndexOf('<');
+                            if (idx > 0)
+                            {
+                                var name = l.Substring(0, idx).Trim();
+                                if (!string.IsNullOrEmpty(name) && !name.Equals("WORKGROUP", StringComparison.OrdinalIgnoreCase)) return name;
+                            }
+                        }
+                    }
+                }
+
+                // avahi resolve (mDNS) - may return 'hostname.local\taddress'
+                var av = await RunProcessCaptureOutputAsync("avahi-resolve", $"-a {ip}", 1500);
+                if (!string.IsNullOrEmpty(av))
+                {
+                    var parts = av.Split(new[] { '\t', ' ', '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                    if (parts.Length >= 1) return parts[0];
+                }
+            }
+
+            // fallback: host command
+            try
+            {
+                var hostOut = await RunProcessCaptureOutputAsync("host", ip, 1500);
+                if (!string.IsNullOrEmpty(hostOut))
+                {
+                    var m = Regex.Match(hostOut, @"pointer\s+([^\s.]+(?:\.[^\s.]+)*)", RegexOptions.IgnoreCase);
+                    if (m.Success) return m.Groups[1].Value.TrimEnd('.');
+                    var toks = hostOut.Split(new[] { '\r', '\n', ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+                    if (toks.Length > 0) return toks.Last();
+                }
+            }
+            catch { }
+        }
+        catch { }
+        return null;
+    }
+
     static void PrintBanner()
     {
         // Minimal ASCII banner inspired by Kali style
@@ -2067,7 +4072,9 @@ class Program
         Console.WriteLine("ter v1.0");
         Console.WriteLine("interactive shell - type 'exit' to quit");
         Console.ResetColor();
-        Console.WriteLine();
+        Console.ForegroundColor = ConsoleColor.Green;
+        Console.WriteLine("new updates every 2 months (or less) so keep updating it");
+        Console.ResetColor();
     }
 
     static void WritePrompt()
@@ -2095,6 +4102,5 @@ class Program
         Console.WriteLine();
         Console.ForegroundColor = ConsoleColor.Green;
         Console.Write("|__ ");
-        Console.ResetColor();
+        Console.ResetColor(); }
     }
-}
